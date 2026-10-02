@@ -1,8 +1,8 @@
-//! `vmkit-sandbox`: runs one VMM inside unprivileged user, PID, mount and net
+//! `vmkit-sandbox`: runs one VMM inside unprivileged user, PID, mount, net, IPC and UTS
 //! namespaces with a minimal root (kiln spec §9.2). Started by the vmkit library.
 //!
 //!   vmkit-sandbox run <plan.json>    outer: user + PID namespaces, attaches pasta, waits for the VMM
-//!   vmkit-sandbox init <plan.json>   inner (PID 1): mount + net namespaces, then execs the VMM
+//!   vmkit-sandbox init <plan.json>   inner (PID 1): mount, net, IPC and UTS namespaces, then execs the VMM
 //!
 //! The outer helper and `init` talk over a socket on `init`'s stdin: `init` sends
 //! `ready` once its namespaces exist, and waits for `go`, which the outer helper sends
@@ -119,6 +119,36 @@ mod linux {
         }
     }
 
+    /// Gives this process a new, empty session keyring, so the VMM cannot reach the keys
+    /// in the caller's session keyring.
+    fn leave_session_keyring() {
+        #[allow(unsafe_code)]
+        // SAFETY: KEYCTL_JOIN_SESSION_KEYRING takes one pointer, the name of the keyring to join,
+        // or NULL for a new anonymous one. NULL is passed, so the kernel reads no memory of ours.
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_keyctl,
+                libc::KEYCTL_JOIN_SESSION_KEYRING as libc::c_long,
+                std::ptr::null::<libc::c_char>(),
+            )
+        };
+        if r < 0 {
+            fail("joining a new session keyring", std::io::Error::last_os_error());
+        }
+    }
+
+    /// Sets both limits of `resource` to `n`.
+    fn limit(resource: Resource, what: &str, n: u64) {
+        setrlimit(
+            resource,
+            Rlimit {
+                current: Some(n),
+                maximum: Some(n),
+            },
+        )
+        .unwrap_or_else(|e| fail(&format!("limiting {what}"), e))
+    }
+
     /// Ends this process the way the VMM ended: the same exit code, or the same signal.
     fn mirror(status: ExitStatus) -> ! {
         if let Some(code) = status.code() {
@@ -161,6 +191,12 @@ mod linux {
         write("/proc/self/setgroups", "deny".into());
         write("/proc/self/uid_map", format!("{uid} {uid} 1"));
         write("/proc/self/gid_map", format!("{gid} {gid} 1"));
+        // Nothing in the sandbox (the VMM above all) may create user namespaces of its own:
+        // this AppArmor profile's permission would otherwise reach the VMM too.
+        fs::write("/proc/sys/user/max_user_namespaces", "0")
+            .unwrap_or_else(|e| fail("writing /proc/sys/user/max_user_namespaces", e));
+        // No core dump holds guest memory.
+        limit(Resource::Core, "core dumps", 0);
         pass_setup_capabilities();
         let (ours, theirs) = UnixStream::pair().unwrap_or_else(|e| fail("socketpair", e));
         let me = std::env::current_exe().unwrap_or_else(|e| fail("finding myself", e));
@@ -324,7 +360,7 @@ mod linux {
                 );
             }
         }
-        unshare(UnshareFlags::NEWNS | UnshareFlags::NEWNET);
+        unshare(UnshareFlags::NEWNS | UnshareFlags::NEWNET | UnshareFlags::NEWIPC | UnshareFlags::NEWUTS);
         if let Some(net) = &plan.net {
             setup_net(net);
         }
@@ -370,18 +406,10 @@ mod linux {
         fs::remove_dir("/old-root").unwrap_or_else(|e| fail("removing old-root", e));
         mount_remount("/", MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV, "")
             .unwrap_or_else(|e| fail("making the root read-only", e));
-        let lim = |r: Resource, what: &str, n: u64| {
-            setrlimit(
-                r,
-                Rlimit {
-                    current: Some(n),
-                    maximum: Some(n),
-                },
-            )
-            .unwrap_or_else(|e| fail(&format!("limiting {what}"), e))
-        };
-        lim(Resource::Nofile, "open files", plan.limits.open_files);
-        lim(Resource::Nproc, "processes", plan.limits.processes);
+        limit(Resource::Nofile, "open files", plan.limits.open_files);
+        limit(Resource::Nproc, "processes", plan.limits.processes);
+        limit(Resource::Core, "core dumps", 0);
+        leave_session_keyring();
         set_no_new_privs(true).unwrap_or_else(|e| fail("no_new_privs", e));
         // The VMM gets no capabilities: no ambient set, and exec as a non-root user.
         clear_ambient_capability_set().unwrap_or_else(|e| fail("clearing ambient capabilities", e));

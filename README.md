@@ -26,8 +26,8 @@ let end = vm.wait()?;
 - **Guest exit:** the guest ends the VM with `capabilities().guest_exit`: `reboot` on Firecracker, `poweroff` on Cloud Hypervisor. A Cloud Hypervisor guest reset is stopped, not rebooted (`EndReason::ResetStopped`), so a workload never runs twice.
 - **Kernel arguments:** the caller's `cmdline` plus the console and backend parameters vmkit appends. Nothing else contributes.
 - **vsock:** guest-initiated connections to host port `P` arrive on the Unix socket `<vm.vsock_socket()>_P` on both backends.
-- **Sandbox:** every VMM runs as the invoking user inside its own user, PID, mount and network namespaces, in a read-only root holding only its devices, `/vmm`, `/vm/kernel`, `/vm/initramfs`, `/vm/disk/<n>` and `/vm/sock/` (which is `<run_dir>/sock`). It has no capabilities, `no_new_privs`, rlimits, and no descriptors but stdio; files are attached by descriptor and symlinks are never followed. With a systemd user session it also runs in a cgroup scope with memory, CPU and task limits (`vmkit::cgroups_available()` says whether; warn when not). The `vmkit-sandbox` helper does the namespace work: `$VMKIT_SANDBOX`, else next to the running program, else on `PATH`.
-- **Network:** `VmSpec::net` gives the guest `eth0` at `172.30.0.2/30` (gateway and DNS `172.30.0.1`, `vmkit::net`) in the VM's own namespace: a tap, an nftables policy (`Egress::Restricted` by default: no link-local or cloud metadata, private, CGNAT, loopback, multicast or host addresses; `allow` exceptions; `DenyAll` but DNS; `Open`), spoofed and IPv6 traffic dropped, and `pasta` for egress through host sockets and port forwards.
+- **Sandbox:** every VMM runs as the invoking user inside its own user, PID, mount, network, IPC and UTS namespaces, in a read-only root holding only its devices, `/vmm`, `/vm/kernel`, `/vm/initramfs`, `/vm/disk/<n>` and `/vm/sock/` (which is `<run_dir>/sock`). It has no capabilities, `no_new_privs`, rlimits (no core dumps), a session keyring of its own, no descriptors but stdio, and cannot create user namespaces of its own. Files are attached by descriptor, and a symlink as the final path component is refused (`O_NOFOLLOW`; symlinks in the directories above it are followed). The library reads and creates the VMM's own files in `<run_dir>/sock` the same way, so a VMM cannot point them elsewhere. The helper refuses to run as root. With a systemd user session it also runs in a cgroup scope with memory, CPU and task limits (`vmkit::cgroups_available()` says whether; warn when not). The `vmkit-sandbox` helper does the namespace work: `$VMKIT_SANDBOX`, else next to the running program, else on `PATH`.
+- **Network:** `VmSpec::net` gives the guest `eth0` at `172.30.0.2/30` (gateway and DNS `172.30.0.1`, `vmkit::net`) in the VM's own namespace: a tap, an nftables policy (`Egress::Restricted` by default: no link-local or cloud metadata, private, CGNAT, loopback, multicast or host addresses, where the host addresses are those present when the VM is created; `allow` exceptions, ignored under `Open`; `DenyAll` but DNS; `Open`), spoofed and IPv6 traffic dropped, and `pasta` for egress through host sockets and port forwards. The VMM itself opens no connections through `pasta`. Host ports below 1024 cannot be forwarded by an unprivileged `pasta` (unless the host lowers `net.ipv4.ip_unprivileged_port_start`): creating the VM fails with `pasta`'s message.
 - **Snapshots:** `Vm::snapshot` and `Vmm::restore` have their final shape but return `Error::Unsupported` until the snapshot work lands.
 
 ## Requirements
@@ -36,11 +36,12 @@ Linux with KVM (`/dev/kvm`, user in the `kvm` group), the pinned VMMs, and the s
 
 ```bash
 scripts/install-vmms.sh ~/.local/bin    # Firecracker 1.17.0 and Cloud Hypervisor 53.0, SHA-256 checked
-cargo install --path . --bin vmkit-sandbox --root ~/.local
-scripts/install-apparmor.sh ~/.local/bin/vmkit-sandbox   # only acts where AppArmor restricts user namespaces
+cargo build --release --bin vmkit-sandbox
+sudo install -m 0755 target/release/vmkit-sandbox /usr/local/bin/
+scripts/install-apparmor.sh /usr/local/bin/vmkit-sandbox   # uses sudo; only acts where AppArmor restricts user namespaces
 ```
 
-Ubuntu 23.10 and later restrict unprivileged user namespaces through AppArmor; the profile lets the helper create its own. Networking also needs `pasta` (passt 2024-02-20 or later, as in Ubuntu 24.04 and Debian 13), `nft` and `ip`; `$VMKIT_PASTA` overrides the `pasta` found on `PATH`.
+Ubuntu 23.10 and later restrict unprivileged user namespaces through AppArmor; the profile lets the helper create its own. The profile grants that to any binary at the given path, so install the helper to a root-owned path such as `/usr/local/bin`, not to a directory you can write. Networking also needs `pasta` (passt 2024-02-20 or later, as in Ubuntu 24.04 and Debian 13), `nft` and `ip`; `$VMKIT_PASTA` overrides the `pasta` found on `PATH`.
 
 The library also builds on macOS (for kiln's non-run commands); creating VMs needs Linux. On a Mac, use the Lima template (Apple M3 or later, macOS 15 or later):
 

@@ -18,9 +18,8 @@ pub(crate) fn find(name: &'static str, env: &'static str) -> Result<PathBuf> {
             Err(Error::BinaryNotFound { binary: name, env })
         };
     }
-    std::env::var_os("PATH")
-        .iter()
-        .flat_map(std::env::split_paths)
+    path_dirs()
+        .into_iter()
         .map(|dir| dir.join(name))
         .find(|p| is_executable(p))
         .ok_or(Error::BinaryNotFound { binary: name, env })
@@ -29,12 +28,24 @@ pub(crate) fn find(name: &'static str, env: &'static str) -> Result<PathBuf> {
 /// A system tool such as `ip` or `nft`: the first on `PATH`, else in the usual system
 /// directories (a user's `PATH` often lacks `/usr/sbin`).
 pub(crate) fn find_system(name: &'static str) -> Result<PathBuf> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
+    path_dirs()
+        .into_iter()
         .chain(["/usr/sbin", "/sbin", "/usr/bin", "/bin"].map(PathBuf::from))
         .map(|dir| dir.join(name))
         .find(|p| is_executable(p))
         .ok_or(Error::ToolNotFound(name))
+}
+
+/// The directories on `PATH`. An empty entry, which a shell would read as the current
+/// directory, is skipped: binaries are never looked up relative to it.
+fn path_dirs() -> Vec<PathBuf> {
+    split_path(&std::env::var_os("PATH").unwrap_or_default())
+}
+
+fn split_path(path: &std::ffi::OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|d| !d.as_os_str().is_empty())
+        .collect()
 }
 
 pub(crate) fn is_executable(p: &Path) -> bool {
@@ -99,6 +110,15 @@ mod tests {
         assert_eq!(parse_version("cloud-hypervisor v54.1-dirty"), Some((54, 1, 0)));
         assert_eq!(parse_version("no version here"), None);
         assert_eq!(parse_version("cloud-hypervisor version v53.0"), Some((53, 0, 0)));
+    }
+
+    #[test]
+    fn empty_path_entries_never_mean_the_current_directory() {
+        assert_eq!(
+            split_path(std::ffi::OsStr::new(":/usr/bin::/bin:")),
+            [PathBuf::from("/usr/bin"), PathBuf::from("/bin")]
+        );
+        assert!(split_path(std::ffi::OsStr::new("")).is_empty());
     }
 
     #[test]

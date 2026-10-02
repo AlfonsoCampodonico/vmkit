@@ -1,6 +1,8 @@
 //! The VMM child process: spawning, readiness, kill and wait.
 
 use std::fs::{File, OpenOptions};
+use std::io;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -18,6 +20,46 @@ const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(10);
 /// How long after a failed API call to look for the VMM's exit before blaming the socket.
 const DEATH_GRACE: Duration = Duration::from_millis(500);
+
+/// Opens `path`, a file the VMM may have written or replaced, for reading. A symlink as the
+/// final component is refused (`O_NOFOLLOW`), a FIFO cannot block the open (`O_NONBLOCK`),
+/// and anything but a regular file is refused.
+pub(crate) fn open_vmm_file(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+/// Creates `path` afresh in a directory the VMM can write: whatever is there (a symlink, say)
+/// is removed, not followed or truncated.
+pub(crate) fn create_vmm_file(path: &Path) -> io::Result<File> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+/// The text of a VMM log, or nothing if it is missing or not a regular file.
+fn read_vmm_log(path: &Path) -> String {
+    let mut text = String::new();
+    if let Ok(mut f) = open_vmm_file(path) {
+        let _ = io::Read::read_to_string(&mut f, &mut text);
+    }
+    text
+}
 
 /// Removes a socket a previous VMM left in the run directory; VMMs refuse to bind over it.
 pub(crate) fn clear_socket(path: &Path) -> Result<()> {
@@ -118,7 +160,7 @@ impl Proc {
     pub(crate) fn log_tail(&self) -> String {
         let mut tail = Vec::new();
         for log in &self.logs {
-            let text = std::fs::read_to_string(log).unwrap_or_default();
+            let text = read_vmm_log(log);
             let lines: Vec<&str> = text.lines().collect();
             tail.extend(lines[lines.len().saturating_sub(5)..].iter().map(|l| l.to_string()));
         }
@@ -356,6 +398,28 @@ mod tests {
         let tail = p.log_tail();
         assert!(tail.contains("it broke"), "{tail}");
         assert!(tail.ends_with("c | d | e | f | g"), "five lines of each log: {tail}");
+    }
+
+    #[test]
+    fn vmm_files_are_never_reached_through_a_symlink_or_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "do not read or truncate\n").unwrap();
+        let log = dir.path().join("vmm.log");
+        std::os::unix::fs::symlink(&secret, &log).unwrap();
+        let p = sh("exit 0", dir.path()).with_log(&log);
+        p.wait(None).unwrap();
+        assert!(!p.log_tail().contains("do not read"), "{}", p.log_tail());
+        assert_eq!(open_vmm_file(&log).unwrap_err().raw_os_error(), Some(libc::ELOOP));
+        // Creating replaces the symlink and leaves its target alone.
+        create_vmm_file(&log).unwrap();
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "do not read or truncate\n");
+        assert!(std::fs::symlink_metadata(&log).unwrap().is_file());
+        // A FIFO neither blocks the open nor is read.
+        let fifo = dir.path().join("fifo");
+        assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let err = open_vmm_file(&fifo).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
     }
 
     #[test]

@@ -53,6 +53,16 @@ impl Cidr {
             prefix,
         })
     }
+
+    /// The network address (host bits cleared).
+    pub fn addr(&self) -> Ipv4Addr {
+        self.addr
+    }
+
+    /// The prefix length.
+    pub fn prefix(&self) -> u8 {
+        self.prefix
+    }
 }
 
 impl FromStr for Cidr {
@@ -114,7 +124,7 @@ pub struct PortForward {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NetSpec {
     pub egress: Egress,
-    /// Exceptions to `Restricted` and `DenyAll`.
+    /// Exceptions to `Restricted` and `DenyAll`; ignored under `Egress::Open`.
     pub allow: Vec<Cidr>,
     pub forwards: Vec<PortForward>,
 }
@@ -139,7 +149,12 @@ impl NetSpec {
 
 /// The nftables ruleset for the VM's namespace. `host` lists the host's own addresses,
 /// which `Restricted` denies (pasta would otherwise reach them through host sockets).
-pub(crate) fn ruleset(spec: &NetSpec, host: &[Ipv4Addr]) -> String {
+///
+/// `forward` polices the guest. `local_out` stops the namespace's own processes (the VMM)
+/// from opening any connection through pasta; their replies to forwarded connections are
+/// not new, and spliced forwards leave through loopback and the tap, not `egress0`.
+#[doc(hidden)]
+pub fn ruleset(spec: &NetSpec, host: &[Ipv4Addr]) -> String {
     let set = |items: Vec<String>| {
         if items.is_empty() {
             String::new()
@@ -202,6 +217,10 @@ pub(crate) fn ruleset(spec: &NetSpec, host: &[Ipv4Addr]) -> String {
     iifname \"{TAP}\" ct state established,related accept
     iifname \"{TAP}\" drop
   }}
+  chain local_out {{
+    type filter hook output priority filter; policy accept;
+    oifname \"{EGRESS}\" ct state new drop
+  }}
 }}
 ",
         deny = set(deny),
@@ -210,7 +229,8 @@ pub(crate) fn ruleset(spec: &NetSpec, host: &[Ipv4Addr]) -> String {
 }
 
 /// `pasta` options, without the namespace to attach to.
-pub(crate) fn pasta_args(spec: &NetSpec) -> Vec<String> {
+#[doc(hidden)]
+pub fn pasta_args(spec: &NetSpec) -> Vec<String> {
     let ports = |p: Protocol| {
         let list: Vec<String> = spec
             .forwards
@@ -274,6 +294,8 @@ mod tests {
         assert_eq!("10.1.2.3/8".parse::<Cidr>().unwrap().to_string(), "10.0.0.0/8");
         assert_eq!("1.2.3.4".parse::<Cidr>().unwrap().to_string(), "1.2.3.4/32");
         assert_eq!("0.0.0.0/0".parse::<Cidr>().unwrap().to_string(), "0.0.0.0/0");
+        let c = "10.1.2.3/8".parse::<Cidr>().unwrap();
+        assert_eq!((c.addr(), c.prefix()), (Ipv4Addr::new(10, 0, 0, 0), 8));
         for bad in ["1.2.3.4/33", "1.2.3/8", "x", "1.2.3.4/", "::1/128"] {
             assert!(bad.parse::<Cidr>().is_err(), "{bad}");
         }
@@ -317,6 +339,27 @@ mod tests {
         assert!(at("meta nfproto ipv6 drop") < at("ct state established,related accept"));
         assert!(at("ip saddr != 172.30.0.2 drop") < at("ct state established,related accept"));
         assert!(at("ip daddr @allow accept") < at("ip daddr @deny drop"));
+    }
+
+    #[test]
+    fn the_namespace_itself_opens_no_connection_through_pasta() {
+        // The VMM runs in the namespace: its own connections take the output hook, not forward.
+        for egress in [Egress::Restricted, Egress::DenyAll, Egress::Open] {
+            let r = ruleset(
+                &NetSpec {
+                    egress,
+                    ..NetSpec::default()
+                },
+                &[],
+            );
+            assert!(
+                r.contains(
+                    "  chain local_out {\n    type filter hook output priority filter; policy accept;\n    \
+                     oifname \"egress0\" ct state new drop\n  }"
+                ),
+                "{egress:?}:\n{r}"
+            );
+        }
     }
 
     #[test]

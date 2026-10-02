@@ -1,6 +1,5 @@
 //! The Firecracker driver.
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -80,7 +79,7 @@ impl Vmm for Firecracker {
         ];
         std::fs::create_dir_all(spec.run_dir.join("sock"))?;
         process::clear_socket(&api)?;
-        File::create(&log)?;
+        process::create_vmm_file(&log)?;
         let proc = sandbox::spawn(
             &self.sandbox,
             &self.binary,
