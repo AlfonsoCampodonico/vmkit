@@ -16,7 +16,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
-  # The contract suite on x86_64 KVM (hosted arm64 runners have no /dev/kvm; aarch64
+  # The sandbox, contract and network suites on x86_64 KVM (hosted arm64 runners have no /dev/kvm; aarch64
   # runs on the Lima template, kiln spec §11.7).
   contract-x86_64:
     runs-on: ubuntu-24.04
@@ -28,7 +28,7 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - run: sudo apt-get update && sudo apt-get install -y busybox-static flex bison bc libelf-dev libssl-dev cpio file
+      - run: sudo apt-get update && sudo apt-get install -y busybox-static flex bison bc libelf-dev libssl-dev cpio file passt nftables
       - run: scripts/install-vmms.sh "$HOME/.local/bin"
       - uses: actions/cache@v4
         with:
@@ -37,11 +37,20 @@ jobs:
       - name: Build the kernel (cached by kernels/)
         run: ls out/vmlinux-*-x86_64 2>/dev/null || kernels/build.sh x86_64 out
       - run: testguest/build-initramfs.sh out/initramfs-x86_64.cpio.gz
-      - name: Contract suite
-        # About half the CPUs: the suite boots one VM per test (private-repo hosted Linux
+      - name: Sandbox helper, its AppArmor profile, and the network fixture
+        run: |
+          cargo build --bin vmkit-sandbox
+          scripts/install-apparmor.sh "$PWD/target/debug/vmkit-sandbox"
+          testguest/net-fixture.sh
+      - name: Sandbox, contract and network suites
+        # About half the CPUs: the suites boot one VM per test (private-repo hosted Linux
         # runners have two vCPUs). Pause/resume runs alone afterwards (see tests/pause.rs).
         run: |
           export PATH="$HOME/.local/bin:$PATH"
+          export VMKIT_SANDBOX=$PWD/target/debug/vmkit-sandbox VMKIT_TEST_NET=1
           export VMKIT_TEST_KERNEL=$(ls out/vmlinux-*-x86_64) VMKIT_TEST_INITRAMFS=out/initramfs-x86_64.cpio.gz VMKIT_REQUIRE_KVM_TESTS=1
-          cargo test --test contract -- --test-threads=$(( $(nproc) > 1 ? $(nproc) / 2 : 1 ))
+          threads=$(( $(nproc) > 1 ? $(nproc) / 2 : 1 ))
+          cargo test --test sandbox
+          cargo test --test contract -- --test-threads=$threads
+          cargo test --test network -- --test-threads=$threads
           cargo test --test pause -- --test-threads=1
