@@ -7,7 +7,10 @@ mod error;
 mod events;
 mod firecracker;
 mod http;
+pub mod net;
 mod process;
+#[doc(hidden)]
+pub mod sandbox;
 mod spec;
 mod vmm;
 
