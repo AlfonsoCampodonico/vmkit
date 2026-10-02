@@ -17,9 +17,9 @@ mod vmm;
 pub use cloud_hypervisor::CloudHypervisor;
 pub use error::{Error, Result};
 pub use firecracker::Firecracker;
-pub use spec::{
-    Capabilities, Disk, EndReason, GuestExit, NetSpec, RestoreSpec, SnapshotBundle, VmEnd, VmSpec, VsockSpec,
-};
+pub use net::NetSpec;
+pub use sandbox::cgroups_available;
+pub use spec::{Capabilities, Disk, EndReason, GuestExit, RestoreSpec, SnapshotBundle, VmEnd, VmSpec, VsockSpec};
 pub use vmm::{Vm, Vmm};
 
 /// The backends `vmkit` drives.

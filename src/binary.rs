@@ -26,7 +26,18 @@ pub(crate) fn find(name: &'static str, env: &'static str) -> Result<PathBuf> {
         .ok_or(Error::BinaryNotFound { binary: name, env })
 }
 
-fn is_executable(p: &Path) -> bool {
+/// A system tool such as `ip` or `nft`: the first on `PATH`, else in the usual system
+/// directories (a user's `PATH` often lacks `/usr/sbin`).
+pub(crate) fn find_system(name: &'static str) -> Result<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .chain(["/usr/sbin", "/sbin", "/usr/bin", "/bin"].map(PathBuf::from))
+        .map(|dir| dir.join(name))
+        .find(|p| is_executable(p))
+        .ok_or(Error::ToolNotFound(name))
+}
+
+pub(crate) fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     p.metadata()
         .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)

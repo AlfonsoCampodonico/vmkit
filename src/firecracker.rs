@@ -8,7 +8,9 @@ use serde_json::{Value, json};
 
 use crate::binary::{self, Version};
 use crate::error::{Error, Result};
+use crate::net;
 use crate::process::{self, Proc};
+use crate::sandbox;
 use crate::spec::{Capabilities, GuestExit, RestoreSpec, SnapshotBundle, VmEnd, VmSpec};
 use crate::vmm::{Vm, Vmm};
 
@@ -17,6 +19,8 @@ const NAME: &str = "firecracker";
 
 pub struct Firecracker {
     binary: PathBuf,
+    /// The sandbox helper every VMM runs under.
+    sandbox: PathBuf,
     arch: &'static str,
 }
 
@@ -27,6 +31,7 @@ impl Firecracker {
         binary::check_version(&binary, NAME, MIN_VERSION)?;
         Ok(Self {
             binary,
+            sandbox: sandbox::find_helper()?,
             arch: std::env::consts::ARCH,
         })
     }
@@ -61,24 +66,26 @@ impl Vmm for Firecracker {
 
     fn create(&self, spec: &VmSpec) -> Result<Box<dyn Vm>> {
         spec.check(&self.capabilities())?;
-        let api = spec.run_dir.join("firecracker.sock");
+        let api = sandbox::host(spec, "firecracker.sock");
         // Without --log-path Firecracker logs to stdout, which is the guest console.
         // It does not open the file for appending, so stderr gets a file of its own.
-        let log = spec.run_dir.join("firecracker.log");
+        let log = sandbox::host(spec, "firecracker.log");
         let args = vec![
             "--api-sock".into(),
-            api.display().to_string(),
+            sandbox::inside("firecracker.sock"),
             "--id".into(),
             "vmkit".into(),
             "--log-path".into(),
-            log.display().to_string(),
+            sandbox::inside("firecracker.log"),
         ];
+        std::fs::create_dir_all(spec.run_dir.join("sock"))?;
         process::clear_socket(&api)?;
         File::create(&log)?;
-        let proc = process::spawn(
+        let proc = sandbox::spawn(
+            &self.sandbox,
             &self.binary,
             &args,
-            &spec.console_log,
+            spec,
             &spec.run_dir.join("firecracker.stderr"),
         )?
         .with_log(&log);
@@ -128,11 +135,11 @@ impl FirecrackerVm {
             json!({"vcpu_count": spec.vcpus, "mem_size_mib": spec.memory_mib}),
         )?;
         let mut boot = json!({
-            "kernel_image_path": spec.kernel,
+            "kernel_image_path": sandbox::KERNEL,
             "boot_args": spec.cmdline.iter().chain(backend_args).cloned().collect::<Vec<_>>().join(" "),
         });
-        if let Some(initrd) = &spec.initramfs {
-            boot["initrd_path"] = json!(initrd);
+        if spec.initramfs.is_some() {
+            boot["initrd_path"] = json!(sandbox::INITRAMFS);
         }
         self.call("PUT", "/boot-source", boot)?;
         // Drives attach in this order: vda, vdb, ...
@@ -141,21 +148,22 @@ impl FirecrackerVm {
             self.call(
                 "PUT",
                 &format!("/drives/{id}"),
-                json!({"drive_id": id, "path_on_host": d.path, "is_root_device": false, "is_read_only": d.read_only}),
+                json!({"drive_id": id, "path_on_host": sandbox::disk(i), "is_root_device": false, "is_read_only": d.read_only}),
             )?;
         }
         if let Some(v) = spec.vsock {
-            let uds = spec.run_dir.join("vsock.sock");
+            let uds = sandbox::host(spec, "vsock.sock");
             process::clear_socket(&uds)?;
-            self.call("PUT", "/vsock", json!({"guest_cid": v.guest_cid, "uds_path": uds}))?;
+            let inside = sandbox::inside("vsock.sock");
+            self.call("PUT", "/vsock", json!({"guest_cid": v.guest_cid, "uds_path": inside}))?;
             self.vsock = Some(uds);
         }
-        if let Some(n) = &spec.net {
-            let mut iface = json!({"iface_id": "eth0", "host_dev_name": n.tap});
-            if let Some(mac) = &n.guest_mac {
-                iface["guest_mac"] = json!(mac);
-            }
-            self.call("PUT", "/network-interfaces/eth0", iface)?;
+        if spec.net.is_some() {
+            self.call(
+                "PUT",
+                "/network-interfaces/eth0",
+                json!({"iface_id": "eth0", "host_dev_name": net::TAP, "guest_mac": net::GUEST_MAC}),
+            )?;
         }
         Ok(())
     }

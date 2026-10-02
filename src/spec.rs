@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use crate::net::NetSpec;
+
 /// One block device, in boot order (`vda`, `vdb`, ...).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Disk {
@@ -16,13 +18,6 @@ pub struct VsockSpec {
     pub guest_cid: u32,
 }
 
-/// A network interface backed by an existing tap device.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NetSpec {
-    pub tap: String,
-    pub guest_mac: Option<String>,
-}
-
 /// A VM to create.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmSpec {
@@ -35,10 +30,12 @@ pub struct VmSpec {
     pub vcpus: u8,
     pub memory_mib: u32,
     pub vsock: Option<VsockSpec>,
+    /// A NIC in the VM's own network namespace (kiln spec §9.3).
     pub net: Option<NetSpec>,
     /// Guest serial output is appended here.
     pub console_log: PathBuf,
-    /// A private (0700) directory for this VM's sockets and logs; it must exist.
+    /// A private (0700) directory for this VM's sandbox plan and logs; it must exist.
+    /// The VMM itself sees only `<run_dir>/sock`, its sockets and own logs.
     pub run_dir: PathBuf,
 }
 
@@ -161,18 +158,7 @@ impl VmSpec {
             )));
         }
         if let Some(n) = &self.net {
-            // The kernel's interface names: 1-15 bytes, no `/`, NUL or whitespace (and not `.` or `..`,
-            // which would widen the Landlock rule for the tap's sysfs directory).
-            let ok = (1..=15).contains(&n.tap.len())
-                && !n.tap.contains(|c: char| c == '/' || c == '\0' || c.is_whitespace())
-                && n.tap != "."
-                && n.tap != "..";
-            if !ok {
-                return Err(crate::Error::InvalidSpec(format!(
-                    "tap name {:?} must be 1-15 bytes with no '/', NUL or whitespace",
-                    n.tap
-                )));
-            }
+            n.check().map_err(crate::Error::InvalidSpec)?;
         }
         Ok(())
     }
@@ -274,21 +260,19 @@ mod tests {
     }
 
     #[test]
-    fn tap_names_are_valid_interface_names() {
-        let tap = |name: &str| {
-            let mut s = spec(0);
-            s.net = Some(NetSpec {
-                tap: name.into(),
-                guest_mac: None,
-            });
-            s.check(&CAPS)
+    fn invalid_port_forwards_are_refused_before_anything_starts() {
+        use crate::net::{PortForward, Protocol};
+        let mut s = spec(0);
+        let fwd = PortForward {
+            protocol: Protocol::Tcp,
+            host: 8080,
+            guest: 80,
         };
-        for good in ["t", "vmkt0", "123456789012345"] {
-            assert!(tap(good).is_ok(), "{good}");
-        }
-        for bad in ["", "1234567890123456", "a/b", "a b", "a\tb", "a\nb", "a\0b", ".", ".."] {
-            assert!(matches!(tap(bad), Err(crate::Error::InvalidSpec(_))), "{bad:?}");
-        }
+        s.net = Some(NetSpec {
+            forwards: vec![fwd, fwd],
+            ..NetSpec::default()
+        });
+        assert!(matches!(s.check(&CAPS), Err(crate::Error::InvalidSpec(m)) if m.contains("8080")));
     }
 
     #[test]

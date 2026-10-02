@@ -33,6 +33,36 @@ pub(crate) fn clear_socket(path: &Path) -> Result<()> {
     }
 }
 
+/// Kills the sandboxed VMM whose PID is in `file`, if it is still the child of the helper
+/// `helper` (a stale file or a reused PID is ignored). True if the signal was sent.
+#[cfg(target_os = "linux")]
+fn kill_vmm(file: &Path, helper: u32) -> bool {
+    use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
+    let Some(pid) = std::fs::read_to_string(file)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+    else {
+        return false;
+    };
+    let Some(fd) = Pid::from_raw(pid).and_then(|p| pidfd_open(p, PidfdFlags::empty()).ok()) else {
+        return false;
+    };
+    // Checked after opening the pidfd, so the signal goes to the process that was checked.
+    let parent = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("PPid:"))
+                .and_then(|v| v.trim().parse::<u32>().ok())
+        });
+    parent == Some(helper) && pidfd_send_signal(&fd, Signal::KILL).is_ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kill_vmm(_file: &Path, _helper: u32) -> bool {
+    false
+}
+
 /// A running VMM. Shared with the Cloud Hypervisor reset backstop, which may kill it.
 #[derive(Clone)]
 pub(crate) struct Proc {
@@ -43,6 +73,8 @@ pub(crate) struct Proc {
     end: Arc<Mutex<Option<VmEnd>>>,
     /// Files with the VMM's own messages, quoted when it exits before its API is up.
     logs: Vec<PathBuf>,
+    /// For a sandboxed VMM: the file with its host PID (see [`Proc::with_vmm_pid_file`]).
+    vmm_pid_file: Option<PathBuf>,
 }
 
 /// Starts `binary args...` with the guest serial (the VMM's stdout) appended to
@@ -63,6 +95,7 @@ pub(crate) fn spawn(binary: &Path, args: &[String], console_log: &Path, log: &Pa
         backstop_failed: Arc::new(AtomicBool::new(false)),
         end: Arc::new(Mutex::new(None)),
         logs: vec![log.to_path_buf()],
+        vmm_pid_file: None,
     })
 }
 
@@ -70,6 +103,14 @@ impl Proc {
     /// Also quotes `path`, a log the VMM writes itself, when the VMM exits early.
     pub(crate) fn with_log(mut self, path: &Path) -> Self {
         self.logs.push(path.to_path_buf());
+        self
+    }
+
+    /// The child is the sandbox helper, and the VMM it runs has its host PID in `path`.
+    /// Killing then kills the VMM itself: the helper reaps it and ends the same way, so
+    /// when the child has ended, so has the VMM.
+    pub(crate) fn with_vmm_pid_file(mut self, path: &Path) -> Self {
+        self.vmm_pid_file = Some(path.to_path_buf());
         self
     }
 
@@ -163,6 +204,11 @@ impl Proc {
 
     fn signal_kill(&self) -> Result<()> {
         let mut child = self.child.lock().expect("not poisoned");
+        if let Some(file) = &self.vmm_pid_file {
+            if kill_vmm(file, child.id()) {
+                return Ok(());
+            }
+        }
         match child.kill() {
             Ok(()) => Ok(()),
             // Already reaped: nothing to kill.

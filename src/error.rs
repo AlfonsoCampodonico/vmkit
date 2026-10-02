@@ -8,6 +8,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("{binary} not found: set {env} or put it on PATH")]
     BinaryNotFound { binary: &'static str, env: &'static str },
+    #[error("{0} not found on PATH or in /usr/sbin, /sbin, /usr/bin or /bin")]
+    ToolNotFound(&'static str),
     #[error("{binary} {found} is older than the minimum supported {min}")]
     VersionTooOld {
         binary: &'static str,
