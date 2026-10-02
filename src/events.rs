@@ -9,7 +9,9 @@ use serde_json::Value;
 
 use crate::process::Proc;
 
-/// Reads a file the VMM is still writing, like `tail -f`, until the VMM exits.
+/// Reads a file the VMM is still writing, like `tail -f`, until the VMM exits. The VMM can
+/// replace the file: a symlink or anything but a regular file is a read error (failing closed),
+/// never followed and never blocking.
 pub(crate) struct Tail {
     path: PathBuf,
     file: Option<File>,
@@ -26,7 +28,11 @@ impl Read for Tail {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             if self.file.is_none() {
-                self.file = File::open(&self.path).ok();
+                match crate::process::open_vmm_file(&self.path) {
+                    Ok(f) => self.file = Some(f),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
             }
             if let Some(f) = &mut self.file {
                 let n = f.read(buf)?;
@@ -147,6 +153,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(watch(Tail::new(events.clone(), proc.clone())), Watch::Reset);
+        proc.kill().unwrap();
+    }
+
+    #[test]
+    fn a_symlinked_or_fifo_event_stream_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.json");
+        std::fs::write(&target, "{\"source\":\"vmm\"}").unwrap();
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let fifo = dir.path().join("fifo.json");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let proc = crate::process::spawn(
+            std::path::Path::new("/bin/sh"),
+            &["-c".into(), "sleep 30".into()],
+            &dir.path().join("console"),
+            &dir.path().join("log"),
+        )
+        .unwrap();
+        for path in [link, fifo] {
+            assert!(
+                matches!(watch(Tail::new(path.clone(), proc.clone())), Watch::Failed(_)),
+                "{}",
+                path.display()
+            );
+        }
         proc.kill().unwrap();
     }
 

@@ -26,15 +26,22 @@ let end = vm.wait()?;
 - **Guest exit:** the guest ends the VM with `capabilities().guest_exit`: `reboot` on Firecracker, `poweroff` on Cloud Hypervisor. A Cloud Hypervisor guest reset is stopped, not rebooted (`EndReason::ResetStopped`), so a workload never runs twice.
 - **Kernel arguments:** the caller's `cmdline` plus the console and backend parameters vmkit appends. Nothing else contributes.
 - **vsock:** guest-initiated connections to host port `P` arrive on the Unix socket `<vm.vsock_socket()>_P` on both backends.
+- **Sandbox:** every VMM runs as the invoking user inside its own user, PID, mount, network, IPC and UTS namespaces, in a read-only root holding only its devices, `/vmm`, `/vm/kernel`, `/vm/initramfs`, `/vm/disk/<n>` and `/vm/sock/` (which is `<run_dir>/sock`). It has no capabilities, `no_new_privs`, rlimits (no core dumps), a session keyring of its own, no descriptors but stdio, and cannot create user namespaces of its own. Files are attached by descriptor, and a symlink as the final path component is refused (`O_NOFOLLOW`; symlinks in the directories above it are followed). The library reads and creates the VMM's own files in `<run_dir>/sock` the same way, so a VMM cannot point them elsewhere. The helper refuses to run as root. With a systemd user session it also runs in a cgroup scope with memory, CPU and task limits (`vmkit::cgroups_available()` says whether; warn when not). The `vmkit-sandbox` helper does the namespace work: `$VMKIT_SANDBOX`, else next to the running program, else on `PATH`.
+- **Network:** `VmSpec::net` gives the guest `eth0` at `172.30.0.2/30` (gateway and DNS `172.30.0.1`, `vmkit::net`) in the VM's own namespace: a tap, an nftables policy (`Egress::Restricted` by default: no link-local or cloud metadata, private, CGNAT, loopback, multicast or host addresses, where the host addresses are those present when the VM is created; `allow` exceptions, ignored under `Open`; `DenyAll` but DNS; `Open`), spoofed and IPv6 traffic dropped, and `pasta` for egress through host sockets and port forwards. The VMM itself opens no connections through `pasta`. Host ports below 1024 cannot be forwarded by an unprivileged `pasta` (unless the host lowers `net.ipv4.ip_unprivileged_port_start`): creating the VM fails with `pasta`'s message.
 - **Snapshots:** `Vm::snapshot` and `Vmm::restore` have their final shape but return `Error::Unsupported` until the snapshot work lands.
 
 ## Requirements
 
-Linux with KVM (`/dev/kvm`, user in the `kvm` group) and the pinned VMMs:
+Linux with KVM (`/dev/kvm`, user in the `kvm` group), the pinned VMMs, and the sandbox helper:
 
 ```bash
 scripts/install-vmms.sh ~/.local/bin    # Firecracker 1.17.0 and Cloud Hypervisor 53.0, SHA-256 checked
+cargo build --release --bin vmkit-sandbox
+sudo install -m 0755 target/release/vmkit-sandbox /usr/local/bin/
+scripts/install-apparmor.sh /usr/local/bin/vmkit-sandbox   # uses sudo; only acts where AppArmor restricts user namespaces
 ```
+
+Ubuntu 23.10 and later restrict unprivileged user namespaces through AppArmor; the profile lets the helper create its own. The profile grants that to any binary at the given path, so install the helper to a root-owned path such as `/usr/local/bin`, not to a directory you can write. Networking also needs `pasta` (passt 2024-02-20 or later, as in Ubuntu 24.04 and Debian 13), `nft` and `ip`; `$VMKIT_PASTA` overrides the `pasta` found on `PATH`.
 
 The library also builds on macOS (for kiln's non-run commands); creating VMs needs Linux. On a Mac, use the Lima template (Apple M3 or later, macOS 15 or later):
 
@@ -75,12 +82,19 @@ Hosted arm64 runners have no KVM, so the aarch64 kernel is boot-tested by hand a
 
 ```bash
 cargo test                                   # unit tests, any platform
+cargo build --bin vmkit-sandbox && scripts/install-apparmor.sh "$PWD/target/debug/vmkit-sandbox"
 testguest/build-initramfs.sh out/initramfs.cpio.gz
-export VMKIT_TEST_KERNEL=out/vmlinux-6.18.54-aarch64 VMKIT_TEST_INITRAMFS=out/initramfs.cpio.gz VMKIT_REQUIRE_KVM_TESTS=1
+testguest/net-fixture.sh                     # fixture addresses for the network tests (sudo, once per boot)
+export VMKIT_SANDBOX=$PWD/target/debug/vmkit-sandbox VMKIT_TEST_NET=1 VMKIT_REQUIRE_KVM_TESTS=1
+export VMKIT_TEST_KERNEL=out/vmlinux-6.18.54-aarch64 VMKIT_TEST_INITRAMFS=out/initramfs.cpio.gz
+cargo test --test sandbox                    # the helper alone, with busybox as the VMM (no KVM)
 cargo test --test contract -- --test-threads=4
+cargo test --test network -- --test-threads=4
 cargo test --test pause -- --test-threads=1
 ```
 
-The contract suite (`tests/contract.rs`) runs every test against both backends with a busybox guest: boot and exit method, reset backstop, panic, kill, disk order, device budget and guest-initiated vsock. Set `VMKIT_TEST_TAP=<tap>` (a tap device you own, e.g. created with `sudo ip tuntap add vmkt0 mode tap user $(id -u)`) to also boot a VM with a network interface; the tap test must run alone because both backends would open the same tap: `VMKIT_TEST_TAP=vmkt0 cargo test --test contract a_tap_backed_nic_boots -- --test-threads=1`. Without `VMKIT_TEST_TAP` it returns early even under `VMKIT_REQUIRE_KVM_TESTS=1`, so CI does not cover it. Each VM's run directory also holds the VMM's own log (`firecracker.log`, `firecracker.stderr` or `cloud-hypervisor.log`) and, if Cloud Hypervisor's reset backstop ever fails, `backstop.log` saying why the VMM was killed (the VM then ends with `EndReason::BackstopFailed`). Pause and resume (`tests/pause.rs`) run alone: Cloud Hypervisor 53 on aarch64 can leave a guest stuck after a resume while other VMs load the host. That was reproduced with plain `ch-remote` under nested virtualization; Firecracker is unaffected. Keep the contract suite's `--test-threads` at about half the CPUs; under heavier load, Cloud Hypervisor guests also stalled occasionally on the same nested setup. A failing test prints the end of the guest console.
+In the Lima VM, build into a guest path (`CARGO_TARGET_DIR=~/target`) and install the profile for `$HOME/target/debug/vmkit-sandbox`.
+
+The contract suite (`tests/contract.rs`) runs every test against both backends with a busybox guest: boot and exit method, reset backstop, panic, kill, disk order, device budget, guest-initiated vsock, and the sandbox's contents and privileges. The network suite (`tests/network.rs`) is the hostile guest: cloud metadata, private and host addresses, the gateway, other VMs and spoofed sources must be unreachable, while allowed destinations, DNS and port forwards work. Set `VMKIT_TEST_TAP=<tap>` (a tap device you own, e.g. created with `sudo ip tuntap add vmkt0 mode tap user $(id -u)`) to also boot a VM with a network interface; the tap test must run alone because both backends would open the same tap: `VMKIT_TEST_TAP=vmkt0 cargo test --test contract a_tap_backed_nic_boots -- --test-threads=1`. Without `VMKIT_TEST_TAP` it returns early even under `VMKIT_REQUIRE_KVM_TESTS=1`, so CI does not cover it. Each VM's run directory also holds the VMM's own log (`firecracker.log`, `firecracker.stderr` or `cloud-hypervisor.log`) and, if Cloud Hypervisor's reset backstop ever fails, `backstop.log` saying why the VMM was killed (the VM then ends with `EndReason::BackstopFailed`). Pause and resume (`tests/pause.rs`) run alone: Cloud Hypervisor 53 on aarch64 can leave a guest stuck after a resume while other VMs load the host. That was reproduced with plain `ch-remote` under nested virtualization; Firecracker is unaffected. Keep the contract suite's `--test-threads` at about half the CPUs; under heavier load, Cloud Hypervisor guests also stalled occasionally on the same nested setup. A failing test prints the end of the guest console.
 
 License: Apache-2.0.
