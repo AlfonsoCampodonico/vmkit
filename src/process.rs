@@ -100,6 +100,15 @@ impl Proc {
         self.signal_kill()
     }
 
+    /// Kills the VMM because the guest reset (Cloud Hypervisor backstop).
+    pub(crate) fn stop_on_reset(&self) -> Result<()> {
+        if self.try_end()?.is_some() {
+            return Ok(());
+        }
+        self.reset_stopped.store(true, Ordering::SeqCst);
+        self.signal_kill()
+    }
+
     fn signal_kill(&self) -> Result<()> {
         let mut child = self.child.lock().expect("not poisoned");
         match child.kill() {
@@ -179,6 +188,10 @@ mod tests {
         let end = p.wait(None).unwrap().unwrap();
         assert_eq!((end.reason, end.signal), (EndReason::Killed, Some(9)));
         p.kill().unwrap();
+
+        let p = sh("sleep 30", dir.path());
+        p.stop_on_reset().unwrap();
+        assert_eq!(p.wait(None).unwrap().unwrap().reason, EndReason::ResetStopped);
     }
 
     #[test]

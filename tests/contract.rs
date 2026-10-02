@@ -155,6 +155,9 @@ macro_rules! contract {
         mod firecracker {
             $( #[test] fn $name() { super::$name(vmkit::Backend::Firecracker) } )*
         }
+        mod cloud_hypervisor {
+            $( #[test] fn $name() { super::$name(vmkit::Backend::CloudHypervisor) } )*
+        }
     };
 }
 

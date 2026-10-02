@@ -2,13 +2,16 @@
 #![forbid(unsafe_code)]
 
 mod binary;
+mod cloud_hypervisor;
 mod error;
+mod events;
 mod firecracker;
 mod http;
 mod process;
 mod spec;
 mod vmm;
 
+pub use cloud_hypervisor::CloudHypervisor;
 pub use error::{Error, Result};
 pub use firecracker::Firecracker;
 pub use spec::{
@@ -20,15 +23,17 @@ pub use vmm::{Vm, Vmm};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Firecracker,
+    CloudHypervisor,
 }
 
 impl Backend {
-    pub const ALL: [Backend; 1] = [Backend::Firecracker];
+    pub const ALL: [Backend; 2] = [Backend::Firecracker, Backend::CloudHypervisor];
 
     /// Finds and version-checks the backend's binary.
     pub fn discover(self) -> Result<Box<dyn Vmm>> {
         Ok(match self {
             Backend::Firecracker => Box::new(Firecracker::discover()?),
+            Backend::CloudHypervisor => Box::new(CloudHypervisor::discover()?),
         })
     }
 }

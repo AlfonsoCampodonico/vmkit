@@ -35,3 +35,8 @@ fn pause_stops_the_guest_and_resume_continues_it(backend: Backend) {
 fn firecracker() {
     pause_stops_the_guest_and_resume_continues_it(Backend::Firecracker)
 }
+
+#[test]
+fn cloud_hypervisor() {
+    pause_stops_the_guest_and_resume_continues_it(Backend::CloudHypervisor)
+}
