@@ -9,7 +9,7 @@ version=$(cat "$here/VERSION")
 series=$(echo "$version" | cut -d. -f1-2)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-curl -sfL -o "$work/linux-$version.tar.xz" "https://cdn.kernel.org/pub/linux/kernel/v${version%%.*}.x/linux-$version.tar.xz"
+curl -sfL --retry 3 --retry-delay 2 -o "$work/linux-$version.tar.xz" "https://cdn.kernel.org/pub/linux/kernel/v${version%%.*}.x/linux-$version.tar.xz"
 (cd "$work" && grep " linux-$version.tar.xz\$" "$here/SHA256SUMS" | sha256sum -c --quiet -)
 (cd "$here" && grep " microvm-kernel-ci-$arch-$series.config\$" SHA256SUMS | sha256sum -c --quiet -)
 tar -xJf "$work/linux-$version.tar.xz" -C "$work"
@@ -30,7 +30,7 @@ missing=0
 for f in "$here/fragments/base.config" "$here/fragments/base-$arch.config"; do
   while IFS= read -r line; do
     case $line in
-      CONFIG_*=*) grep -qx "$line" "$src/.config" || { echo "missing: $line"; missing=1; } ;;
+      CONFIG_*=*) grep -qxF "$line" "$src/.config" || { echo "missing: $line"; missing=1; } ;;
       "# CONFIG_"*" is not set")
         opt=${line#\# }; opt=${opt%% *}
         ! grep -q "^$opt=" "$src/.config" || { echo "still set: $opt"; missing=1; } ;;

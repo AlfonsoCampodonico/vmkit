@@ -53,6 +53,7 @@ pub enum GuestExit {
 
 /// What a backend supports. Callers decide from these, never from the backend's name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Capabilities {
     /// Virtio devices the machine model allows in total.
     pub max_virtio_devices: u32,
@@ -69,12 +70,13 @@ pub struct Capabilities {
 impl Capabilities {
     /// Devices left for the caller's disks, vsock and network.
     pub fn available_devices(&self) -> u32 {
-        self.max_virtio_devices - self.implicit_devices
+        self.max_virtio_devices.saturating_sub(self.implicit_devices)
     }
 }
 
 /// Why a VM ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EndReason {
     /// The VMM exited by itself (the guest ended, or the VMM failed).
     Exited,
@@ -82,6 +84,8 @@ pub enum EndReason {
     Killed,
     /// The guest reset and `vmkit` stopped the VMM rather than let it reboot.
     ResetStopped,
+    /// The reset backstop could not watch the VMM, so `vmkit` killed it; see `<run_dir>/backstop.log`.
+    BackstopFailed,
 }
 
 /// How a VM ended.
@@ -150,6 +154,26 @@ impl VmSpec {
                 )));
             }
         }
+        if !self.run_dir.is_dir() {
+            return Err(crate::Error::InvalidSpec(format!(
+                "run_dir {} is not an existing directory",
+                self.run_dir.display()
+            )));
+        }
+        if let Some(n) = &self.net {
+            // The kernel's interface names: 1-15 bytes, no `/`, NUL or whitespace (and not `.` or `..`,
+            // which would widen the Landlock rule for the tap's sysfs directory).
+            let ok = (1..=15).contains(&n.tap.len())
+                && !n.tap.contains(|c: char| c == '/' || c == '\0' || c.is_whitespace())
+                && n.tap != "."
+                && n.tap != "..";
+            if !ok {
+                return Err(crate::Error::InvalidSpec(format!(
+                    "tap name {:?} must be 1-15 bytes with no '/', NUL or whitespace",
+                    n.tap
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -157,6 +181,11 @@ impl VmSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An existing directory for `run_dir`.
+    fn here() -> PathBuf {
+        std::env::temp_dir()
+    }
 
     fn spec(disks: usize) -> VmSpec {
         VmSpec {
@@ -174,7 +203,7 @@ mod tests {
             vsock: Some(VsockSpec { guest_cid: 3 }),
             net: None,
             console_log: "c".into(),
-            run_dir: "r".into(),
+            run_dir: here(),
         }
     }
 
@@ -224,6 +253,42 @@ mod tests {
         s.run_dir = bad;
         assert!(matches!(s.check(&CAPS), Err(crate::Error::InvalidSpec(_))));
         assert!(spec(1).check(&CAPS).is_ok());
+    }
+
+    #[test]
+    fn the_run_dir_must_be_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = spec(0);
+        s.run_dir = dir.path().to_path_buf();
+        assert!(s.check(&CAPS).is_ok());
+        s.run_dir = dir.path().join("missing");
+        let err = s.check(&CAPS).unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::InvalidSpec(m) if m.contains("missing")),
+            "{err}"
+        );
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        s.run_dir = file;
+        assert!(matches!(s.check(&CAPS), Err(crate::Error::InvalidSpec(_))));
+    }
+
+    #[test]
+    fn tap_names_are_valid_interface_names() {
+        let tap = |name: &str| {
+            let mut s = spec(0);
+            s.net = Some(NetSpec {
+                tap: name.into(),
+                guest_mac: None,
+            });
+            s.check(&CAPS)
+        };
+        for good in ["t", "vmkt0", "123456789012345"] {
+            assert!(tap(good).is_ok(), "{good}");
+        }
+        for bad in ["", "1234567890123456", "a/b", "a b", "a\tb", "a\nb", "a\0b", ".", ".."] {
+            assert!(matches!(tap(bad), Err(crate::Error::InvalidSpec(_))), "{bad:?}");
+        }
     }
 
     #[test]

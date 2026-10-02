@@ -10,11 +10,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
+use crate::http;
 use crate::spec::{EndReason, VmEnd};
 
 /// How long a VMM may take to open its API socket.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(10);
+/// How long after a failed API call to look for the VMM's exit before blaming the socket.
+const DEATH_GRACE: Duration = Duration::from_millis(500);
 
 /// Removes a socket a previous VMM left in the run directory; VMMs refuse to bind over it.
 pub(crate) fn clear_socket(path: &Path) -> Result<()> {
@@ -36,6 +39,7 @@ pub(crate) struct Proc {
     child: Arc<Mutex<Child>>,
     killed: Arc<AtomicBool>,
     reset_stopped: Arc<AtomicBool>,
+    backstop_failed: Arc<AtomicBool>,
     end: Arc<Mutex<Option<VmEnd>>>,
     /// Files with the VMM's own messages, quoted when it exits before its API is up.
     logs: Vec<PathBuf>,
@@ -56,6 +60,7 @@ pub(crate) fn spawn(binary: &Path, args: &[String], console_log: &Path, log: &Pa
         child: Arc::new(Mutex::new(child)),
         killed: Arc::new(AtomicBool::new(false)),
         reset_stopped: Arc::new(AtomicBool::new(false)),
+        backstop_failed: Arc::new(AtomicBool::new(false)),
         end: Arc::new(Mutex::new(None)),
         logs: vec![log.to_path_buf()],
     })
@@ -68,26 +73,59 @@ impl Proc {
         self
     }
 
+    /// The last lines of the VMM's logs, for error messages (empty when there are none).
+    pub(crate) fn log_tail(&self) -> String {
+        let mut tail = Vec::new();
+        for log in &self.logs {
+            let text = std::fs::read_to_string(log).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            tail.extend(lines[lines.len().saturating_sub(5)..].iter().map(|l| l.to_string()));
+        }
+        tail.join(" | ")
+    }
+
+    fn early_exit(&self, end: VmEnd) -> Error {
+        Error::EarlyExit(format!("{end:?}: {}", self.log_tail()))
+    }
+
     /// Waits until `socket` accepts connections, failing early if the VMM exits.
     pub(crate) fn wait_for_socket(&self, socket: &Path) -> Result<()> {
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
             if let Some(end) = self.try_end()? {
-                let mut tail = Vec::new();
-                for log in &self.logs {
-                    let text = std::fs::read_to_string(log).unwrap_or_default();
-                    let lines: Vec<&str> = text.lines().collect();
-                    tail.extend(lines[lines.len().saturating_sub(5)..].iter().map(|l| l.to_string()));
-                }
-                return Err(Error::EarlyExit(format!("{end:?}: {}", tail.join(" | "))));
+                return Err(self.early_exit(end));
             }
             if UnixStream::connect(socket).is_ok() {
                 return Ok(());
             }
             if Instant::now() > deadline {
-                return Err(Error::Timeout("the VMM API socket"));
+                return Err(Error::Timeout(format!(
+                    "the VMM API socket (VMM log: {})",
+                    self.log_tail()
+                )));
             }
             std::thread::sleep(POLL);
+        }
+    }
+
+    /// One API request. If the socket fails because the VMM died, the error says so (with the
+    /// end of its logs) rather than reporting a bare I/O error.
+    pub(crate) fn request(
+        &self,
+        socket: &Path,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<http::Response> {
+        match http::request(socket, method, path, body) {
+            Err(Error::Io(io)) => {
+                // The exit may be a moment behind the closed connection.
+                match self.wait(Some(DEATH_GRACE))? {
+                    Some(end) => Err(self.early_exit(end)),
+                    None => Err(Error::Io(io)),
+                }
+            }
+            other => other,
         }
     }
 
@@ -106,6 +144,20 @@ impl Proc {
             return Ok(());
         }
         self.reset_stopped.store(true, Ordering::SeqCst);
+        let result = self.signal_kill();
+        if result.is_err() {
+            // Not stopped after all: the backstop reports its failure instead.
+            self.reset_stopped.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+
+    /// Kills the VMM because the reset backstop can no longer watch it (idempotent).
+    pub(crate) fn fail_backstop(&self) -> Result<()> {
+        if self.try_end()?.is_some() {
+            return Ok(());
+        }
+        self.backstop_failed.store(true, Ordering::SeqCst);
         self.signal_kill()
     }
 
@@ -122,6 +174,8 @@ impl Proc {
     fn end_from(&self, status: ExitStatus) -> VmEnd {
         let reason = if self.reset_stopped.load(Ordering::SeqCst) {
             EndReason::ResetStopped
+        } else if self.backstop_failed.load(Ordering::SeqCst) {
+            EndReason::BackstopFailed
         } else if self.killed.load(Ordering::SeqCst) {
             EndReason::Killed
         } else {
@@ -137,10 +191,10 @@ impl Proc {
     /// The end, if the VMM has exited (non-blocking).
     pub(crate) fn try_end(&self) -> Result<Option<VmEnd>> {
         let mut end = self.end.lock().expect("not poisoned");
-        if end.is_none()
-            && let Some(status) = self.child.lock().expect("not poisoned").try_wait()?
-        {
-            *end = Some(self.end_from(status));
+        if end.is_none() {
+            if let Some(status) = self.child.lock().expect("not poisoned").try_wait()? {
+                *end = Some(self.end_from(status));
+            }
         }
         Ok(*end)
     }
@@ -192,6 +246,24 @@ mod tests {
         let p = sh("sleep 30", dir.path());
         p.stop_on_reset().unwrap();
         assert_eq!(p.wait(None).unwrap().unwrap().reason, EndReason::ResetStopped);
+
+        let p = sh("sleep 30", dir.path());
+        p.fail_backstop().unwrap();
+        let end = p.wait(None).unwrap().unwrap();
+        assert_eq!((end.reason, end.signal), (EndReason::BackstopFailed, Some(9)));
+        p.fail_backstop().unwrap();
+    }
+
+    #[test]
+    fn failing_the_backstop_of_a_finished_process_keeps_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = sh("exit 0", dir.path());
+        assert_eq!(
+            p.wait(Some(Duration::from_secs(5))).unwrap().unwrap().reason,
+            EndReason::Exited
+        );
+        p.fail_backstop().unwrap();
+        assert_eq!(p.wait(None).unwrap().unwrap().reason, EndReason::Exited);
     }
 
     #[test]
@@ -226,6 +298,43 @@ mod tests {
             std::fs::read_to_string(dir.path().join("console")).unwrap(),
             "one\ntwo\n"
         );
+    }
+
+    #[test]
+    fn log_tail_quotes_the_stderr_and_the_own_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let own_log = dir.path().join("own.log");
+        std::fs::write(&own_log, "a\nb\nc\nd\ne\nf\ng\n").unwrap();
+        let p = sh("echo 'it broke' >&2", dir.path()).with_log(&own_log);
+        p.wait(None).unwrap();
+        let tail = p.log_tail();
+        assert!(tail.contains("it broke"), "{tail}");
+        assert!(tail.ends_with("c | d | e | f | g"), "five lines of each log: {tail}");
+    }
+
+    #[test]
+    fn a_failed_request_after_the_vmm_died_is_an_early_exit() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("api.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        // The "VMM" dies shortly after the connection drops.
+        let p = sh("echo 'vmm exploded' >&2; sleep 0.2", dir.path());
+        let server = std::thread::spawn(move || drop(listener.accept().unwrap()));
+        let err = p.request(&sock, "PUT", "/x", None).unwrap_err();
+        server.join().unwrap();
+        assert!(
+            matches!(&err, Error::EarlyExit(m) if m.contains("vmm exploded")),
+            "{err}"
+        );
+
+        // A VMM that is still alive leaves the I/O error alone.
+        let live = sh("sleep 30", dir.path());
+        let err = live
+            .request(&dir.path().join("missing.sock"), "PUT", "/x", None)
+            .unwrap_err();
+        live.kill().unwrap();
+        assert!(matches!(err, Error::Io(_)), "{err}");
     }
 
     #[test]

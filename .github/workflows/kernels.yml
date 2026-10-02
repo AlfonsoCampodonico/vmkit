@@ -1,7 +1,7 @@
 # Builds, boot-tests and publishes the `base` kernel profile (kiln spec §8.2).
 # Runs on a `kernels-<version>` tag (e.g. kernels-6.18.54) or by hand; publishing
 # needs the tag. aarch64 has no hosted KVM, so its boot test runs on the Lima template
-# before tagging.
+# before tagging, and publishing requires the kernel to match kernels/tested-aarch64.sha256.
 name: kernels
 on:
   push:
@@ -21,6 +21,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y busybox-static flex bison bc libelf-dev libssl-dev cpio file
       - run: sudo apt-get install -y gcc-aarch64-linux-gnu
       - run: kernels/build.sh ${{ matrix.arch }} out
@@ -33,7 +34,8 @@ jobs:
           testguest/build-initramfs.sh out/initramfs-x86_64.cpio.gz
           export PATH="$HOME/.local/bin:$PATH"
           export VMKIT_TEST_KERNEL=$(ls out/vmlinux-*-x86_64) VMKIT_TEST_INITRAMFS=out/initramfs-x86_64.cpio.gz VMKIT_REQUIRE_KVM_TESTS=1
-          cargo test --test contract -- --test-threads=4
+          # About half the CPUs: one VM per test, and private-repo hosted runners have two vCPUs.
+          cargo test --test contract -- --test-threads=$(( $(nproc) > 1 ? $(nproc) / 2 : 1 ))
           cargo test --test pause -- --test-threads=1
       - uses: actions/upload-artifact@v4
         with:
@@ -54,6 +56,22 @@ jobs:
           merge-multiple: true
       - name: Check the tag matches kernels/VERSION
         run: test "${GITHUB_REF_NAME#kernels-}" = "$(cat kernels/VERSION)"
+      - name: Require the aarch64 kernel to be the one boot-tested
+        # aarch64 has no hosted KVM, so a person boot-tests it on the Lima template and
+        # commits its hash (README, Kernel). The cross-build is reproducible, so the tag's
+        # build must match that hash.
+        run: |
+          version=$(cat kernels/VERSION)
+          if [ ! -f kernels/tested-aarch64.sha256 ]; then
+            echo "::error::kernels/tested-aarch64.sha256 is missing: boot-test out/vmlinux-$version-aarch64 on the Lima template and commit its sha256sum (see README, Kernel)"
+            exit 1
+          fi
+          expected=$(cat kernels/tested-aarch64.sha256)
+          actual=$(cd out && sha256sum "vmlinux-$version-aarch64")
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::the built aarch64 kernel is not the boot-tested one: kernels/tested-aarch64.sha256 has '$expected' but this build is '$actual'. Boot-test the new build and commit its hash."
+            exit 1
+          fi
       - run: cd out && sha256sum vmlinux-* config-* > SHA256SUMS && cat SHA256SUMS
       - name: GitHub release
         env:

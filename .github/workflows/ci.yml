@@ -1,5 +1,7 @@
 name: ci
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   test:
     strategy:
@@ -36,10 +38,10 @@ jobs:
         run: ls out/vmlinux-*-x86_64 2>/dev/null || kernels/build.sh x86_64 out
       - run: testguest/build-initramfs.sh out/initramfs-x86_64.cpio.gz
       - name: Contract suite
-        # Four threads: the suite boots one VM per test, and hosted runners have four cores.
-        # Pause/resume runs alone afterwards (see tests/pause.rs).
+        # About half the CPUs: the suite boots one VM per test (private-repo hosted Linux
+        # runners have two vCPUs). Pause/resume runs alone afterwards (see tests/pause.rs).
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           export VMKIT_TEST_KERNEL=$(ls out/vmlinux-*-x86_64) VMKIT_TEST_INITRAMFS=out/initramfs-x86_64.cpio.gz VMKIT_REQUIRE_KVM_TESTS=1
-          cargo test --test contract -- --test-threads=4
+          cargo test --test contract -- --test-threads=$(( $(nproc) > 1 ? $(nproc) / 2 : 1 ))
           cargo test --test pause -- --test-threads=1

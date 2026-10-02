@@ -2,6 +2,7 @@ use thiserror::Error;
 
 /// Everything `vmkit` can fail with.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
@@ -34,7 +35,7 @@ pub enum Error {
     #[error("the VMM exited before it was ready ({0})")]
     EarlyExit(String),
     #[error("timed out waiting for {0}")]
-    Timeout(&'static str),
+    Timeout(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -6,6 +6,8 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::error::{Error, Result};
+
 /// Largest response body accepted (API errors are a few hundred bytes).
 const MAX_BODY: u64 = 1 << 20;
 /// Largest status or header line accepted, and most headers.
@@ -18,13 +20,17 @@ pub(crate) struct Response {
     pub body: String,
 }
 
-/// Sends one request with an optional JSON body and reads the response.
-pub(crate) fn request(
-    socket: &Path,
-    method: &str,
-    path: &str,
-    body: Option<&serde_json::Value>,
-) -> io::Result<Response> {
+/// Sends one request with an optional JSON body and reads the response. A socket failure
+/// (including the VMM closing the connection) is `Error::Io`; an answer that is not valid
+/// HTTP is `Error::Http`.
+pub(crate) fn request(socket: &Path, method: &str, path: &str, body: Option<&serde_json::Value>) -> Result<Response> {
+    exchange(socket, method, path, body).map_err(|e| match e.kind() {
+        io::ErrorKind::InvalidData => Error::Http(e.to_string()),
+        _ => Error::Io(e),
+    })
+}
+
+fn exchange(socket: &Path, method: &str, path: &str, body: Option<&serde_json::Value>) -> io::Result<Response> {
     let mut stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
@@ -38,8 +44,14 @@ pub(crate) fn request(
     read_response(BufReader::new(stream))
 }
 
+/// A response that is not valid HTTP (becomes `Error::Http`).
 fn bad(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
+}
+
+/// The peer closed the connection mid-response (stays `Error::Io`: the VMM may have died).
+fn closed(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, msg)
 }
 
 /// Reads one line of at most `MAX_LINE` bytes; a longer one is an error.
@@ -53,7 +65,9 @@ fn read_line(r: &mut impl BufRead, line: &mut String) -> io::Result<usize> {
 
 fn read_response(mut r: impl BufRead) -> io::Result<Response> {
     let mut line = String::new();
-    read_line(&mut r, &mut line)?;
+    if read_line(&mut r, &mut line)? == 0 {
+        return Err(closed("connection closed before a response"));
+    }
     let mut fields = line.split_whitespace();
     let status = fields
         .next()
@@ -66,7 +80,7 @@ fn read_response(mut r: impl BufRead) -> io::Result<Response> {
     loop {
         line.clear();
         if read_line(&mut r, &mut line)? == 0 {
-            return Err(bad("connection closed in headers"));
+            return Err(closed("connection closed in headers"));
         }
         let header = line.trim_end();
         if header.is_empty() {
@@ -76,8 +90,9 @@ fn read_response(mut r: impl BufRead) -> io::Result<Response> {
         if headers > MAX_HEADERS {
             return Err(bad("too many response headers"));
         }
-        if let Some((name, value)) = header.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
+        if let Some((_, value)) = header
+            .split_once(':')
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
         {
             length = Some(
                 value
@@ -94,7 +109,7 @@ fn read_response(mut r: impl BufRead) -> io::Result<Response> {
     let mut body = Vec::with_capacity(length as usize);
     r.take(length).read_to_end(&mut body)?;
     if body.len() as u64 != length {
-        return Err(bad("connection closed in body"));
+        return Err(closed("connection closed in body"));
     }
     Ok(Response {
         status,
@@ -114,6 +129,50 @@ mod tests {
         assert_eq!((r.status, r.body.as_str()), (400, "{\"fault\":\"nope\"}\n"));
         let no_content = read_response(&b"HTTP/1.1 204 No Content\r\n\r\n"[..]).unwrap();
         assert_eq!((no_content.status, no_content.body.as_str()), (204, ""));
+    }
+
+    fn kind(raw: &[u8]) -> io::ErrorKind {
+        read_response(raw).unwrap_err().kind()
+    }
+
+    #[test]
+    fn a_closed_connection_is_an_io_error_and_bad_http_is_invalid_data() {
+        use io::ErrorKind::{InvalidData, UnexpectedEof};
+        assert_eq!(kind(b""), UnexpectedEof);
+        assert_eq!(
+            kind(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort"),
+            UnexpectedEof
+        );
+        assert_eq!(kind(b"HTTP/1.1 200 OK\r\nContent-Le"), UnexpectedEof);
+        assert_eq!(kind(b"garbage\r\n\r\n"), InvalidData);
+        assert_eq!(kind(b"HTTP/1.1 200 OK\r\nContent-Length: x\r\n\r\n"), InvalidData);
+        assert_eq!(
+            kind(b"HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n"),
+            InvalidData
+        );
+    }
+
+    #[test]
+    fn request_maps_protocol_errors_to_http_and_socket_errors_to_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("api.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            // First connection: not HTTP. Second: closed without an answer.
+            let (mut s, _) = listener.accept().unwrap();
+            let mut req = [0u8; 1024];
+            let _ = s.read(&mut req).unwrap();
+            s.write_all(b"not http\r\n\r\n").unwrap();
+            drop(s);
+            drop(listener.accept().unwrap());
+        });
+        let err = request(&sock, "GET", "/", None).unwrap_err();
+        assert!(matches!(&err, Error::Http(m) if m.contains("bad status line")), "{err}");
+        let err = request(&sock, "GET", "/", None).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err}");
+        server.join().unwrap();
+        let err = request(&dir.path().join("missing.sock"), "GET", "/", None).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err}");
     }
 
     #[test]

@@ -21,7 +21,7 @@ esac
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 fetch() { # url sha out
-  curl -sfL -o "$3" "$1"
+  curl -sfL --retry 3 --retry-delay 2 -o "$3" "$1"
   echo "$2  $3" | sha256sum -c --quiet -
 }
 fetch "https://github.com/firecracker-microvm/firecracker/releases/download/v$fc_version/firecracker-v$fc_version-$arch.tgz" "$fc_sha" "$work/fc.tgz"

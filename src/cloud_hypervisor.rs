@@ -9,7 +9,6 @@ use serde_json::{Value, json};
 use crate::binary::{self, Version};
 use crate::error::{Error, Result};
 use crate::events;
-use crate::http;
 use crate::process::{self, Proc};
 use crate::spec::{Capabilities, GuestExit, RestoreSpec, SnapshotBundle, VmEnd, VmSpec};
 use crate::vmm::{Vm, Vmm};
@@ -74,7 +73,7 @@ fn run_backstop(proc: Proc, events: PathBuf, log: PathBuf) {
         },
         events::Watch::Failed(e) => format!("cannot read the event stream: {e}"),
     };
-    let _ = proc.kill();
+    let _ = proc.fail_backstop();
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
         let _ = writeln!(f, "vmkit: reset backstop failed: {failure}; the VMM was killed");
     }
@@ -152,7 +151,7 @@ struct ChVm {
 impl ChVm {
     fn call(&self, path: &str, body: Option<Value>) -> Result<()> {
         let path = format!("/api/v1/{path}");
-        let r = http::request(&self.api, "PUT", &path, body.as_ref())?;
+        let r = self.proc.request(&self.api, "PUT", &path, body.as_ref())?;
         if !(200..300).contains(&r.status) {
             return Err(Error::Api {
                 backend: NAME,

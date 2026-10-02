@@ -8,7 +8,6 @@ use serde_json::{Value, json};
 
 use crate::binary::{self, Version};
 use crate::error::{Error, Result};
-use crate::http;
 use crate::process::{self, Proc};
 use crate::spec::{Capabilities, GuestExit, RestoreSpec, SnapshotBundle, VmEnd, VmSpec};
 use crate::vmm::{Vm, Vmm};
@@ -109,7 +108,7 @@ struct FirecrackerVm {
 
 impl FirecrackerVm {
     fn call(&self, method: &'static str, path: &str, body: Value) -> Result<()> {
-        let r = http::request(&self.api, method, path, Some(&body))?;
+        let r = self.proc.request(&self.api, method, path, Some(&body))?;
         if !(200..300).contains(&r.status) {
             return Err(Error::Api {
                 backend: NAME,
