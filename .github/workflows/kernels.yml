@@ -8,8 +8,7 @@ on:
     tags: ["kernels-*"]
   workflow_dispatch:
 permissions:
-  contents: write
-  packages: write
+  contents: read
 jobs:
   build:
     strategy:
@@ -18,11 +17,12 @@ jobs:
           - arch: x86_64
             runner: ubuntu-24.04
           - arch: aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-24.04
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y busybox-static flex bison bc libelf-dev libssl-dev
+      - run: sudo apt-get update && sudo apt-get install -y busybox-static flex bison bc libelf-dev libssl-dev cpio file
+      - run: sudo apt-get install -y gcc-aarch64-linux-gnu
       - run: kernels/build.sh ${{ matrix.arch }} out
       - name: Boot test on both VMMs (x86_64)
         if: matrix.arch == 'x86_64'
@@ -43,6 +43,9 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/kernels-')
     needs: build
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -58,11 +61,15 @@ jobs:
         run: gh release create "$GITHUB_REF_NAME" out/vmlinux-* out/config-* out/SHA256SUMS --title "base kernel $(cat kernels/VERSION)" --notes "vmkit base kernel profile, Linux $(cat kernels/VERSION)."
       - uses: oras-project/setup-oras@v1
       - name: OCI artifacts on ghcr.io
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
         run: |
-          echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "$GH_TOKEN" | oras login ghcr.io -u "$ACTOR" --password-stdin
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
           version=$(cat kernels/VERSION)
           for arch in x86_64 aarch64; do
-            (cd out && oras push "ghcr.io/${{ github.repository_owner }}/vmkit-kernels/base:$version-$arch" \
+            (cd out && oras push "ghcr.io/$owner/vmkit-kernels/base:$version-$arch" \
               --artifact-type application/vnd.vmkit.kernel.v1 \
               "vmlinux-$version-$arch:application/vnd.vmkit.kernel.v1.binary" \
               "config-$version-$arch:application/vnd.vmkit.kernel.v1.config")
