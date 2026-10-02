@@ -121,7 +121,19 @@ fn deny_all_leaves_only_dns_and_open_removes_the_denies(backend: Backend) {
     };
     c.run(&net_spec(&c, deny_all, &extra));
     assert_eq!(verdict(&c, "tcp", &format!("{PRIVATE}:{port}")), "closed");
+    assert_eq!(verdict(&c, "tcp", &format!("{HOST}:{port}")), "closed");
     assert_eq!(dns(&c, "localhost"), "ok");
+
+    // Allow exceptions apply under deny-all.
+    let Some(c) = net_case(backend) else { return };
+    let deny_all_but_private = NetSpec {
+        egress: Egress::DenyAll,
+        allow: vec![format!("{PRIVATE}/32").parse::<Cidr>().unwrap()],
+        ..NetSpec::default()
+    };
+    c.run(&net_spec(&c, deny_all_but_private, &probes(&[PRIVATE, HOST], port)));
+    assert_eq!(verdict(&c, "tcp", &format!("{PRIVATE}:{port}")), "open");
+    assert_eq!(verdict(&c, "tcp", &format!("{HOST}:{port}")), "closed");
 
     let Some(c) = net_case(backend) else { return };
     let open = NetSpec {
@@ -185,14 +197,25 @@ fn port_forwards_reach_the_guest_but_other_vms_do_not(backend: Backend) {
             "{target}"
         );
     }
-    let vmm_pid = std::fs::read_to_string(vmkit::sandbox::pid_file(server.dir.path())).unwrap();
+    let netns = netns_of(server.dir.path()).expect("the VMM's pid file");
+    assert!(pasta_for(&netns), "no pasta attached to {netns} while the VM runs");
     vm.kill().unwrap();
     vm.wait_timeout(END).unwrap().expect("killed");
     // pasta lived in the VM's PID namespace, so it ended with the VMM.
-    let netns = format!("/proc/{}/ns/net", vmm_pid.trim());
+    assert_pasta_gone(&netns);
+}
+
+/// The network namespace path of the VMM recorded in `run_dir`, if it got that far.
+fn netns_of(run_dir: &std::path::Path) -> Option<String> {
+    let pid = std::fs::read_to_string(vmkit::sandbox::pid_file(run_dir)).ok()?;
+    Some(format!("/proc/{}/ns/net", pid.trim()))
+}
+
+/// Waits (briefly) for every pasta attached to `netns` to exit.
+fn assert_pasta_gone(netns: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while pasta_for(&netns) {
-        assert!(Instant::now() < deadline, "pasta outlived its VM");
+    while pasta_for(netns) {
+        assert!(Instant::now() < deadline, "pasta outlived its VM ({netns})");
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -217,11 +240,22 @@ fn a_host_port_in_use_fails_with_pastas_message(backend: Backend) {
         }],
         ..NetSpec::default()
     };
+    let started = Instant::now();
     let err = c.vmm.create(&net_spec(&c, net, &[])).err().expect("the port is taken");
     assert!(
-        matches!(&err, vmkit::Error::EarlyExit(m) if m.contains("pasta")),
+        started.elapsed() < Duration::from_secs(30),
+        "create hung for {:?}",
+        started.elapsed()
+    );
+    // pasta's own message, not just the helper's wrapper text.
+    assert!(
+        matches!(&err, vmkit::Error::EarlyExit(m) if m.contains("pasta") && m.contains("Address already in use")),
         "{err}"
     );
+    // No pasta is left behind by the failed VM.
+    if let Some(netns) = netns_of(c.dir.path()) {
+        assert_pasta_gone(&netns);
+    }
 }
 
 macro_rules! network {

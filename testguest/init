@@ -49,6 +49,7 @@ case $action in
     /bin/busybox ip addr add "$ip" dev eth0
     /bin/busybox ip link set eth0 up
     /bin/busybox ip route add default via "$gw"
+    echo "VMKIT-NET-CONFIGURED"
     if [ -n "$serve" ]; then
       /bin/busybox mkdir -p /srv && echo VMKIT-SERVED > /srv/index.html
       /bin/busybox httpd -p "$serve" -h /srv && echo "VMKIT-SERVING $serve"
