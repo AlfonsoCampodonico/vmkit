@@ -1,5 +1,6 @@
 //! The Firecracker driver.
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -62,19 +63,26 @@ impl Vmm for Firecracker {
     fn create(&self, spec: &VmSpec) -> Result<Box<dyn Vm>> {
         spec.check(&self.capabilities())?;
         let api = spec.run_dir.join("firecracker.sock");
+        // Without --log-path Firecracker logs to stdout, which is the guest console.
+        // It does not open the file for appending, so stderr gets a file of its own.
+        let log = spec.run_dir.join("firecracker.log");
         let args = vec![
             "--api-sock".into(),
             api.display().to_string(),
             "--id".into(),
             "vmkit".into(),
+            "--log-path".into(),
+            log.display().to_string(),
         ];
         process::clear_socket(&api)?;
+        File::create(&log)?;
         let proc = process::spawn(
             &self.binary,
             &args,
             &spec.console_log,
-            &spec.run_dir.join("firecracker.log"),
-        )?;
+            &spec.run_dir.join("firecracker.stderr"),
+        )?
+        .with_log(&log);
         let vm = FirecrackerVm {
             proc,
             api,

@@ -34,7 +34,10 @@ fn is_executable(p: &Path) -> bool {
 
 /// The first `v<digits>[.<digits>...]` token of `text`.
 pub(crate) fn parse_version(text: &str) -> Option<Version> {
-    let token = text.split_whitespace().find_map(|t| t.strip_prefix('v'))?;
+    let token = text.split_whitespace().find_map(|t| {
+        t.strip_prefix('v')
+            .filter(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+    })?;
     let mut parts = token.split('.').map(|p| {
         p.split(|c: char| !c.is_ascii_digit())
             .next()
@@ -84,6 +87,7 @@ mod tests {
         );
         assert_eq!(parse_version("cloud-hypervisor v54.1-dirty"), Some((54, 1, 0)));
         assert_eq!(parse_version("no version here"), None);
+        assert_eq!(parse_version("cloud-hypervisor version v53.0"), Some((53, 0, 0)));
     }
 
     #[test]

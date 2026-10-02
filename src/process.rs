@@ -37,11 +37,12 @@ pub(crate) struct Proc {
     killed: Arc<AtomicBool>,
     reset_stopped: Arc<AtomicBool>,
     end: Arc<Mutex<Option<VmEnd>>>,
-    log: PathBuf,
+    /// Files with the VMM's own messages, quoted when it exits before its API is up.
+    logs: Vec<PathBuf>,
 }
 
 /// Starts `binary args...` with the guest serial (the VMM's stdout) appended to
-/// `console_log` and the VMM's own messages in `log`.
+/// `console_log` and the VMM's stderr in `log`.
 pub(crate) fn spawn(binary: &Path, args: &[String], console_log: &Path, log: &Path) -> Result<Proc> {
     let console = OpenOptions::new().create(true).append(true).open(console_log)?;
     let log_file = File::create(log)?;
@@ -56,27 +57,29 @@ pub(crate) fn spawn(binary: &Path, args: &[String], console_log: &Path, log: &Pa
         killed: Arc::new(AtomicBool::new(false)),
         reset_stopped: Arc::new(AtomicBool::new(false)),
         end: Arc::new(Mutex::new(None)),
-        log: log.to_path_buf(),
+        logs: vec![log.to_path_buf()],
     })
 }
 
 impl Proc {
+    /// Also quotes `path`, a log the VMM writes itself, when the VMM exits early.
+    pub(crate) fn with_log(mut self, path: &Path) -> Self {
+        self.logs.push(path.to_path_buf());
+        self
+    }
+
     /// Waits until `socket` accepts connections, failing early if the VMM exits.
     pub(crate) fn wait_for_socket(&self, socket: &Path) -> Result<()> {
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
             if let Some(end) = self.try_end()? {
-                let tail = std::fs::read_to_string(&self.log).unwrap_or_default();
-                let tail: String = tail
-                    .lines()
-                    .rev()
-                    .take(5)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                return Err(Error::EarlyExit(format!("{end:?}: {tail}")));
+                let mut tail = Vec::new();
+                for log in &self.logs {
+                    let text = std::fs::read_to_string(log).unwrap_or_default();
+                    let lines: Vec<&str> = text.lines().collect();
+                    tail.extend(lines[lines.len().saturating_sub(5)..].iter().map(|l| l.to_string()));
+                }
+                return Err(Error::EarlyExit(format!("{end:?}: {}", tail.join(" | "))));
             }
             if UnixStream::connect(socket).is_ok() {
                 return Ok(());
@@ -88,8 +91,11 @@ impl Proc {
         }
     }
 
-    /// Kills the VMM (idempotent).
+    /// Kills the VMM (idempotent). A VMM that already ended keeps its own end reason.
     pub(crate) fn kill(&self) -> Result<()> {
+        if self.try_end()?.is_some() {
+            return Ok(());
+        }
         self.killed.store(true, Ordering::SeqCst);
         self.signal_kill()
     }
@@ -176,6 +182,16 @@ mod tests {
     }
 
     #[test]
+    fn killing_a_finished_process_keeps_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = sh("exit 0", dir.path());
+        let end = p.wait(Some(Duration::from_secs(5))).unwrap().unwrap();
+        assert_eq!(end.reason, EndReason::Exited);
+        p.kill().unwrap();
+        assert_eq!(p.wait(None).unwrap().unwrap().reason, EndReason::Exited);
+    }
+
+    #[test]
     fn console_is_appended_not_truncated() {
         let dir = tempfile::tempdir().unwrap();
         for word in ["one", "two"] {
@@ -188,12 +204,14 @@ mod tests {
     }
 
     #[test]
-    fn early_exit_is_reported_with_the_vmm_log() {
+    fn early_exit_is_reported_with_the_vmm_logs() {
         let dir = tempfile::tempdir().unwrap();
-        let p = sh("echo 'bad flag' >&2; exit 1", dir.path());
+        let own_log = dir.path().join("own.log");
+        std::fs::write(&own_log, "first\nlogger says no\n").unwrap();
+        let p = sh("echo 'bad flag' >&2; exit 1", dir.path()).with_log(&own_log);
         let err = p.wait_for_socket(&dir.path().join("never.sock")).unwrap_err();
         assert!(
-            matches!(&err, Error::EarlyExit(msg) if msg.contains("bad flag")),
+            matches!(&err, Error::EarlyExit(msg) if msg.contains("bad flag") && msg.contains("logger says no")),
             "{err}"
         );
     }

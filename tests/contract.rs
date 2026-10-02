@@ -9,7 +9,7 @@ mod common;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{Case, END};
 use vmkit::{Backend, Disk, EndReason, Error, GuestExit, VsockSpec};
@@ -19,6 +19,10 @@ fn boots_and_ends_with_the_exit_method(backend: Backend) {
     let (_vm, end) = c.run(&c.spec("up"));
     assert_eq!(end.reason, EndReason::Exited, "{end:?}");
     assert_eq!(c.console().matches("VMKIT-GUEST-UP").count(), 1);
+    assert!(
+        !c.console().contains("Running Firecracker"),
+        "VMM log lines in the guest console"
+    );
 }
 
 fn a_guest_reset_ends_the_vm_once(backend: Backend) {
@@ -120,7 +124,23 @@ fn guest_vsock_connections_reach_the_host_socket(backend: Backend) {
     // Guest-initiated connections to port P arrive on `<socket>_P` on both backends.
     let listener = UnixListener::bind(format!("{}_1234", host.display())).unwrap();
     vm.start().unwrap();
-    let (stream, _) = listener.accept().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + END;
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the guest never connected; console tail:\n{}",
+                    c.tail()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    };
+    stream.set_nonblocking(false).unwrap();
     let mut line = String::new();
     BufReader::new(&stream).read_line(&mut line).unwrap();
     assert_eq!(line, "VMKIT-VSOCK-HELLO\n");

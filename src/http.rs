@@ -8,6 +8,9 @@ use std::time::Duration;
 
 /// Largest response body accepted (API errors are a few hundred bytes).
 const MAX_BODY: u64 = 1 << 20;
+/// Largest status or header line accepted, and most headers.
+const MAX_LINE: u64 = 8192;
+const MAX_HEADERS: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Response {
@@ -39,23 +42,39 @@ fn bad(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
+/// Reads one line of at most `MAX_LINE` bytes; a longer one is an error.
+fn read_line(r: &mut impl BufRead, line: &mut String) -> io::Result<usize> {
+    let n = (&mut *r).take(MAX_LINE).read_line(line)?;
+    if n as u64 == MAX_LINE && !line.ends_with('\n') {
+        return Err(bad("response line too long"));
+    }
+    Ok(n)
+}
+
 fn read_response(mut r: impl BufRead) -> io::Result<Response> {
     let mut line = String::new();
-    r.read_line(&mut line)?;
-    let status = line
-        .split_whitespace()
-        .nth(1)
+    read_line(&mut r, &mut line)?;
+    let mut fields = line.split_whitespace();
+    let status = fields
+        .next()
+        .filter(|v| v.starts_with("HTTP/1."))
+        .and(fields.next())
         .and_then(|s| s.parse::<u16>().ok())
         .ok_or_else(|| bad(format!("bad status line {line:?}")))?;
     let mut length: Option<u64> = None;
+    let mut headers = 0;
     loop {
         line.clear();
-        if r.read_line(&mut line)? == 0 {
+        if read_line(&mut r, &mut line)? == 0 {
             return Err(bad("connection closed in headers"));
         }
         let header = line.trim_end();
         if header.is_empty() {
             break;
+        }
+        headers += 1;
+        if headers > MAX_HEADERS {
+            return Err(bad("too many response headers"));
         }
         if let Some((name, value)) = header.split_once(':')
             && name.eq_ignore_ascii_case("content-length")
@@ -102,6 +121,13 @@ mod tests {
         assert!(read_response(&b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort"[..]).is_err());
         assert!(read_response(&b"HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n"[..]).is_err());
         assert!(read_response(&b"garbage\r\n\r\n"[..]).is_err());
+        assert!(read_response(&b"garbage 200 OK\r\n\r\n"[..]).is_err());
+        let long = format!("HTTP/1.1 200 OK\r\nX: {}\r\n\r\n", "a".repeat(9000));
+        assert!(read_response(long.as_bytes()).is_err());
+        let many = format!("HTTP/1.1 200 OK\r\n{}\r\n", "X: 1\r\n".repeat(101));
+        assert!(read_response(many.as_bytes()).is_err());
+        let ok = format!("HTTP/1.1 200 OK\r\n{}\r\n", "X: 1\r\n".repeat(100));
+        assert!(read_response(ok.as_bytes()).is_ok());
     }
 
     #[test]

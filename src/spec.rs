@@ -137,6 +137,19 @@ impl VmSpec {
                 "kernel arguments must be single non-empty words".into(),
             ));
         }
+        // Paths go to the VMMs as JSON strings, which cannot carry arbitrary bytes.
+        let paths = [&self.kernel, &self.console_log, &self.run_dir]
+            .into_iter()
+            .chain(self.initramfs.as_ref())
+            .chain(self.disks.iter().map(|d| &d.path));
+        for path in paths {
+            if path.to_str().is_none() {
+                return Err(crate::Error::InvalidSpec(format!(
+                    "path {} is not valid UTF-8",
+                    path.display()
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -190,6 +203,27 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paths_must_be_valid_utf8() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::path::PathBuf::from(OsStr::from_bytes(b"/tmp/\xff.img"));
+        let mut s = spec(1);
+        s.disks[0].path = bad.clone();
+        assert!(matches!(s.check(&CAPS), Err(crate::Error::InvalidSpec(_))));
+        let mut s = spec(0);
+        s.kernel = bad.clone();
+        assert!(matches!(s.check(&CAPS), Err(crate::Error::InvalidSpec(_))));
+        let mut s = spec(0);
+        s.initramfs = Some(bad.clone());
+        assert!(matches!(s.check(&CAPS), Err(crate::Error::InvalidSpec(_))));
+        let mut s = spec(0);
+        s.run_dir = bad;
+        assert!(matches!(s.check(&CAPS), Err(crate::Error::InvalidSpec(_))));
+        assert!(spec(1).check(&CAPS).is_ok());
     }
 
     #[test]

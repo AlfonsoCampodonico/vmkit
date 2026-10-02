@@ -21,7 +21,7 @@ pub fn env() -> Option<Env> {
         (Some(kernel), Some(initramfs)) => Some(Env { kernel, initramfs }),
         _ => {
             assert!(
-                std::env::var_os("VMKIT_REQUIRE_KVM_TESTS").is_none(),
+                std::env::var_os("VMKIT_REQUIRE_KVM_TESTS").is_none_or(|v| v != "1"),
                 "VMKIT_REQUIRE_KVM_TESTS is set but VMKIT_TEST_KERNEL/VMKIT_TEST_INITRAMFS are not"
             );
             None
