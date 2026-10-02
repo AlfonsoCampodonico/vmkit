@@ -205,6 +205,18 @@ mod tests {
     }
 
     #[test]
+    fn stopping_a_finished_process_on_reset_keeps_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = sh("exit 0", dir.path());
+        assert_eq!(
+            p.wait(Some(Duration::from_secs(5))).unwrap().unwrap().reason,
+            EndReason::Exited
+        );
+        p.stop_on_reset().unwrap();
+        assert_eq!(p.wait(None).unwrap().unwrap().reason, EndReason::Exited);
+    }
+
+    #[test]
     fn console_is_appended_not_truncated() {
         let dir = tempfile::tempdir().unwrap();
         for word in ["one", "two"] {

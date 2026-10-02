@@ -1,5 +1,6 @@
 //! The Cloud Hypervisor driver.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -44,7 +45,39 @@ fn landlock_rules(spec: &VmSpec) -> Vec<Value> {
         rules.push(rule(&d.path, if d.read_only { "r" } else { "rw" }));
     }
     rules.push(rule(&spec.run_dir, "rw"));
+    if let Some(n) = &spec.net {
+        // Opening a tap needs the tun device and reading its flags from sysfs.
+        rules.push(rule(Path::new("/dev/net/tun"), "rw"));
+        rules.push(rule(&Path::new("/sys/class/net").join(&n.tap), "r"));
+    }
     rules
+}
+
+/// Cloud Hypervisor splits `path=` option values on commas, so the run directory cannot have one.
+fn check_run_dir(spec: &VmSpec) -> Result<()> {
+    if spec.run_dir.to_string_lossy().contains(',') {
+        return Err(Error::InvalidSpec(format!(
+            "run_dir {} contains a comma, which Cloud Hypervisor's option parser cannot take",
+            spec.run_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The backstop thread: ends the VM on a guest reset, and kills the VMM if it can no longer watch.
+fn run_backstop(proc: Proc, events: PathBuf, log: PathBuf) {
+    let failure = match events::watch(events::Tail::new(events, proc.clone())) {
+        events::Watch::Ended => return,
+        events::Watch::Reset => match proc.stop_on_reset() {
+            Ok(()) => return,
+            Err(e) => format!("could not stop the VMM after a guest reset: {e}"),
+        },
+        events::Watch::Failed(e) => format!("cannot read the event stream: {e}"),
+    };
+    let _ = proc.kill();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+        let _ = writeln!(f, "vmkit: reset backstop failed: {failure}; the VMM was killed");
+    }
 }
 
 impl Vmm for CloudHypervisor {
@@ -66,6 +99,7 @@ impl Vmm for CloudHypervisor {
 
     fn create(&self, spec: &VmSpec) -> Result<Box<dyn Vm>> {
         spec.check(&self.capabilities())?;
+        check_run_dir(spec)?;
         let api = spec.run_dir.join("cloud-hypervisor.sock");
         let events = spec.run_dir.join("events.json");
         // A previous VM's events (say, its reset) must not reach this VM's backstop.
@@ -90,11 +124,8 @@ impl Vmm for CloudHypervisor {
         )?;
         // The backstop: a guest reset must end the VM, never reboot it (kiln spec §4.1).
         let watcher = proc.clone();
-        std::thread::spawn(move || {
-            events::watch(events::Tail::new(events, watcher.clone()), || {
-                let _ = watcher.stop_on_reset();
-            });
-        });
+        let backstop_log = spec.run_dir.join("backstop.log");
+        std::thread::spawn(move || run_backstop(watcher, events, backstop_log));
         let mut vm = ChVm {
             proc,
             api,
@@ -212,5 +243,81 @@ impl Drop for ChVm {
     fn drop(&mut self) {
         let _ = self.proc.kill();
         let _ = self.proc.wait(Some(Duration::from_secs(5)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{Disk, NetSpec};
+
+    fn spec() -> VmSpec {
+        VmSpec {
+            kernel: "/k/vmlinux".into(),
+            initramfs: Some("/k/initramfs".into()),
+            cmdline: Vec::new(),
+            disks: vec![
+                Disk {
+                    path: "/d/ro.img".into(),
+                    read_only: true,
+                },
+                Disk {
+                    path: "/d/rw.img".into(),
+                    read_only: false,
+                },
+            ],
+            vcpus: 1,
+            memory_mib: 128,
+            vsock: None,
+            net: None,
+            console_log: "/run/vm/console.log".into(),
+            run_dir: "/run/vm".into(),
+        }
+    }
+
+    fn rules(spec: &VmSpec) -> Vec<(String, String)> {
+        landlock_rules(spec)
+            .iter()
+            .map(|r| (r["path"].as_str().unwrap().into(), r["access"].as_str().unwrap().into()))
+            .collect()
+    }
+
+    #[test]
+    fn landlock_allows_only_the_vms_own_files() {
+        let r = rules(&spec());
+        let expected: Vec<(&str, &str)> = vec![
+            ("/k/vmlinux", "r"),
+            ("/k/initramfs", "r"),
+            ("/d/ro.img", "r"),
+            ("/d/rw.img", "rw"),
+            ("/run/vm", "rw"),
+        ];
+        assert_eq!(
+            r,
+            expected
+                .iter()
+                .map(|(p, a)| (p.to_string(), a.to_string()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn landlock_allows_the_tap_device_when_there_is_a_nic() {
+        let mut s = spec();
+        s.net = Some(NetSpec {
+            tap: "vmkt0".into(),
+            guest_mac: None,
+        });
+        let r = rules(&s);
+        assert!(r.contains(&("/dev/net/tun".into(), "rw".into())), "{r:?}");
+        assert!(r.contains(&("/sys/class/net/vmkt0".into(), "r".into())), "{r:?}");
+    }
+
+    #[test]
+    fn a_comma_in_the_run_dir_is_refused() {
+        let mut s = spec();
+        assert!(check_run_dir(&s).is_ok());
+        s.run_dir = "/run/a,b".into();
+        assert!(matches!(check_run_dir(&s), Err(Error::InvalidSpec(_))));
     }
 }

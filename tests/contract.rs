@@ -12,7 +12,7 @@ use std::os::unix::net::UnixListener;
 use std::time::{Duration, Instant};
 
 use common::{Case, END};
-use vmkit::{Backend, Disk, EndReason, Error, GuestExit, VsockSpec};
+use vmkit::{Backend, Disk, EndReason, Error, GuestExit, NetSpec, VsockSpec};
 
 fn boots_and_ends_with_the_exit_method(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
@@ -40,9 +40,15 @@ fn a_guest_reset_ends_the_vm_once(backend: Backend) {
 
 fn a_panic_ends_the_vm(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
+    // Both a panic and PID 1 exiting make the guest reset: Firecracker exits on it
+    // (`reboot=k`), and Cloud Hypervisor's backstop stops the VMM. Never a plain kill.
+    let expected = match c.vmm.capabilities().guest_exit {
+        GuestExit::Reboot => EndReason::Exited,
+        GuestExit::Poweroff => EndReason::ResetStopped,
+    };
     for action in ["panic", "exit"] {
         let (_vm, end) = c.run(&c.spec(action));
-        assert_ne!(end.reason, EndReason::Killed, "{action}: {end:?}");
+        assert_eq!(end.reason, expected, "{action}: {end:?}");
     }
     assert_eq!(c.console().matches("VMKIT-GUEST-UP").count(), 2, "{}", c.console());
 }
@@ -150,6 +156,20 @@ fn guest_vsock_connections_reach_the_host_socket(backend: Backend) {
     assert!(c.console().contains("VMKIT-VSOCK-REPLY HOST-ACK"), "{}", c.console());
 }
 
+/// Needs `VMKIT_TEST_TAP` to name an existing tap the test user may open; otherwise it returns early,
+/// even under VMKIT_REQUIRE_KVM_TESTS (automatic network tests arrive with M2b).
+fn a_tap_backed_nic_boots(backend: Backend) {
+    let Ok(tap) = std::env::var("VMKIT_TEST_TAP") else {
+        return;
+    };
+    let Some(c) = Case::new(backend) else { return };
+    let mut spec = c.spec("up");
+    spec.net = Some(NetSpec { tap, guest_mac: None });
+    let (_vm, end) = c.run(&spec);
+    assert_eq!(end.reason, EndReason::Exited, "{end:?}\n{}", c.tail());
+    assert_eq!(c.console().matches("VMKIT-GUEST-UP").count(), 1, "{}", c.console());
+}
+
 macro_rules! contract {
     ($($name:ident),* $(,)?) => {
         mod firecracker {
@@ -169,4 +189,5 @@ contract!(
     disks_attach_in_order,
     device_budget_is_enforced_before_any_vmm_starts,
     guest_vsock_connections_reach_the_host_socket,
+    a_tap_backed_nic_boots,
 );
