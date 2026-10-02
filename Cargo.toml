@@ -6,6 +6,7 @@ license = "Apache-2.0"
 description = "VMM-neutral microVM lifecycle for Firecracker and Cloud Hypervisor"
 
 [dependencies]
+serde_json = "1.0.151"
 thiserror = "2.0.21"
 
 [dev-dependencies]
