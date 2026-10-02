@@ -1,0 +1,69 @@
+# Builds, boot-tests and publishes the `base` kernel profile (kiln spec §8.2).
+# Runs on a `kernels-<version>` tag (e.g. kernels-6.18.54) or by hand; publishing
+# needs the tag. aarch64 has no hosted KVM, so its boot test runs on the Lima template
+# before tagging.
+name: kernels
+on:
+  push:
+    tags: ["kernels-*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+  packages: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y busybox-static flex bison bc libelf-dev libssl-dev
+      - run: kernels/build.sh ${{ matrix.arch }} out
+      - name: Boot test on both VMMs (x86_64)
+        if: matrix.arch == 'x86_64'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          scripts/install-vmms.sh "$HOME/.local/bin"
+          testguest/build-initramfs.sh out/initramfs-x86_64.cpio.gz
+          export PATH="$HOME/.local/bin:$PATH"
+          export VMKIT_TEST_KERNEL=$(ls out/vmlinux-*-x86_64) VMKIT_TEST_INITRAMFS=out/initramfs-x86_64.cpio.gz VMKIT_REQUIRE_KVM_TESTS=1
+          cargo test --test contract -- --test-threads=4
+          cargo test --test pause -- --test-threads=1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.arch }}
+          path: out/*-${{ matrix.arch }}
+  publish:
+    if: startsWith(github.ref, 'refs/tags/kernels-')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Check the tag matches kernels/VERSION
+        run: test "${GITHUB_REF_NAME#kernels-}" = "$(cat kernels/VERSION)"
+      - run: cd out && sha256sum vmlinux-* config-* > SHA256SUMS && cat SHA256SUMS
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" out/vmlinux-* out/config-* out/SHA256SUMS --title "base kernel $(cat kernels/VERSION)" --notes "vmkit base kernel profile, Linux $(cat kernels/VERSION)."
+      - uses: oras-project/setup-oras@v1
+      - name: OCI artifacts on ghcr.io
+        run: |
+          echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          version=$(cat kernels/VERSION)
+          for arch in x86_64 aarch64; do
+            (cd out && oras push "ghcr.io/${{ github.repository_owner }}/vmkit-kernels/base:$version-$arch" \
+              --artifact-type application/vnd.vmkit.kernel.v1 \
+              "vmlinux-$version-$arch:application/vnd.vmkit.kernel.v1.binary" \
+              "config-$version-$arch:application/vnd.vmkit.kernel.v1.config")
+          done
