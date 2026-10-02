@@ -1,0 +1,35 @@
+#!/bin/busybox sh
+# vmkit contract-suite guest. Kernel arguments:
+#   vmkit.test=<action>  up | reboot | panic | exit | idle | vsock | disks
+#   vmkit.exit=<method>  poweroff | reboot  (how "up", "vsock" and "disks" end)
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sys /sys
+/bin/busybox mount -t devtmpfs dev /dev
+action=up
+method=poweroff
+for arg in $(/bin/busybox cat /proc/cmdline); do
+  case $arg in
+    vmkit.test=*) action=${arg#vmkit.test=} ;;
+    vmkit.exit=*) method=${arg#vmkit.exit=} ;;
+  esac
+done
+end() {
+  case $method in
+    reboot) /bin/busybox reboot -f ;;
+    *) /bin/busybox poweroff -f ;;
+  esac
+}
+echo "VMKIT-GUEST-UP action=$action"
+case $action in
+  up) end ;;
+  reboot) /bin/busybox reboot -f ;;
+  panic) echo c > /proc/sysrq-trigger ;;
+  exit) exit 0 ;;  # PID 1 exiting panics the kernel
+  idle) while :; do echo "VMKIT-GUEST-TICK"; /bin/busybox sleep 0.2; done ;;
+  vsock) /bin/vsock-hello 1234; end ;;
+  disks)
+    for d in /sys/block/vd*; do echo "VMKIT-DISK $(/bin/busybox basename "$d") $(/bin/busybox cat "$d/size")"; done
+    end ;;
+esac
+/bin/busybox sleep 5
+echo "VMKIT-GUEST-FELL-THROUGH"

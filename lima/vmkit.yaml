@@ -1,0 +1,30 @@
+# vmkit development VM: Firecracker and Cloud Hypervisor on nested KVM (kiln spec §10).
+# Needs an Apple M3 or later and macOS 15 or later.
+#   limactl start --name vmkit lima/vmkit.yaml
+#   limactl shell vmkit -- <repo>/scripts/install-vmms.sh
+# The macOS home is mounted read-only: build into guest paths
+# (CARGO_TARGET_DIR=~/target, kernels/build.sh aarch64 ~/out).
+base: template:ubuntu-26.04
+vmType: vz
+nestedVirtualization: true
+cpus: 8
+memory: 16GiB
+disk: 80GiB
+mounts:
+  - location: "~"
+    writable: false
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y build-essential flex bison bc libelf-dev libssl-dev busybox-static cpio file curl \
+        gcc-x86-64-linux-gnu passt nftables iproute2 uidmap socat
+      usermod -aG kvm "{{.User}}"
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux
+      command -v rustup || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c clippy,rustfmt

@@ -1,0 +1,94 @@
+# Builds, boot-tests and publishes the `base` kernel profile (kiln spec §8.2).
+# Runs on a `kernels-<version>` tag (e.g. kernels-6.18.54) or by hand; publishing
+# needs the tag. aarch64 has no hosted KVM, so its boot test runs on the Lima template
+# before tagging, and publishing requires the kernel to match kernels/tested-aarch64.sha256.
+name: kernels
+on:
+  push:
+    tags: ["kernels-*"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y busybox-static flex bison bc libelf-dev libssl-dev cpio file
+      - run: sudo apt-get install -y gcc-aarch64-linux-gnu
+      - run: kernels/build.sh ${{ matrix.arch }} out
+      - name: Boot test on both VMMs (x86_64)
+        if: matrix.arch == 'x86_64'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          scripts/install-vmms.sh "$HOME/.local/bin"
+          testguest/build-initramfs.sh out/initramfs-x86_64.cpio.gz
+          export PATH="$HOME/.local/bin:$PATH"
+          export VMKIT_TEST_KERNEL=$(ls out/vmlinux-*-x86_64) VMKIT_TEST_INITRAMFS=out/initramfs-x86_64.cpio.gz VMKIT_REQUIRE_KVM_TESTS=1
+          # About half the CPUs: one VM per test, and private-repo hosted runners have two vCPUs.
+          cargo test --test contract -- --test-threads=$(( $(nproc) > 1 ? $(nproc) / 2 : 1 ))
+          cargo test --test pause -- --test-threads=1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.arch }}
+          path: out/*-${{ matrix.arch }}
+  publish:
+    if: startsWith(github.ref, 'refs/tags/kernels-')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Check the tag matches kernels/VERSION
+        run: test "${GITHUB_REF_NAME#kernels-}" = "$(cat kernels/VERSION)"
+      - name: Require the aarch64 kernel to be the one boot-tested
+        # aarch64 has no hosted KVM, so a person boot-tests it on the Lima template and
+        # commits its hash (README, Kernel). The cross-build is reproducible, so the tag's
+        # build must match that hash.
+        run: |
+          version=$(cat kernels/VERSION)
+          if [ ! -f kernels/tested-aarch64.sha256 ]; then
+            echo "::error::kernels/tested-aarch64.sha256 is missing: boot-test out/vmlinux-$version-aarch64 on the Lima template and commit its sha256sum (see README, Kernel)"
+            exit 1
+          fi
+          expected=$(cat kernels/tested-aarch64.sha256)
+          actual=$(cd out && sha256sum "vmlinux-$version-aarch64")
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::the built aarch64 kernel is not the boot-tested one: kernels/tested-aarch64.sha256 has '$expected' but this build is '$actual'. Boot-test the new build and commit its hash."
+            exit 1
+          fi
+      - run: cd out && sha256sum vmlinux-* config-* > SHA256SUMS && cat SHA256SUMS
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" out/vmlinux-* out/config-* out/SHA256SUMS --title "base kernel $(cat kernels/VERSION)" --notes "vmkit base kernel profile, Linux $(cat kernels/VERSION)."
+      - uses: oras-project/setup-oras@v1
+      - name: OCI artifacts on ghcr.io
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "$GH_TOKEN" | oras login ghcr.io -u "$ACTOR" --password-stdin
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          version=$(cat kernels/VERSION)
+          for arch in x86_64 aarch64; do
+            (cd out && oras push "ghcr.io/$owner/vmkit-kernels/base:$version-$arch" \
+              --artifact-type application/vnd.vmkit.kernel.v1 \
+              "vmlinux-$version-$arch:application/vnd.vmkit.kernel.v1.binary" \
+              "config-$version-$arch:application/vnd.vmkit.kernel.v1.config")
+          done
