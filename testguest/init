@@ -1,18 +1,35 @@
 #!/bin/busybox sh
 # vmkit contract-suite guest. Kernel arguments:
-#   vmkit.test=<action>  up | reboot | panic | exit | idle | vsock | disks
-#   vmkit.exit=<method>  poweroff | reboot  (how "up", "vsock" and "disks" end)
+#   vmkit.test=<action>  up | reboot | panic | exit | idle | vsock | disks | net
+#   vmkit.exit=<method>  poweroff | reboot  (how "up", "vsock", "disks" and "net" end)
+#   vmkit.ip=<addr/len> vmkit.gw=<addr>  configure eth0 (with vmkit.test=net)
+#   vmkit.probe=<ip>:<port>  try a TCP connection (repeatable)
+#   vmkit.dns=<name>         resolve a name through the gateway (repeatable)
+#   vmkit.spoof=<addr/len>   then probe again from this unassigned source address
+#   vmkit.serve=<port>       serve HTTP on this port ("VMKIT-SERVED"), then wait for vmkit.hold=<seconds>
 /bin/busybox mount -t proc proc /proc
 /bin/busybox mount -t sysfs sys /sys
 /bin/busybox mount -t devtmpfs dev /dev
 action=up
 method=poweroff
+ip= gw= probes= names= spoof= serve= hold=0
 for arg in $(/bin/busybox cat /proc/cmdline); do
   case $arg in
     vmkit.test=*) action=${arg#vmkit.test=} ;;
     vmkit.exit=*) method=${arg#vmkit.exit=} ;;
+    vmkit.ip=*) ip=${arg#vmkit.ip=} ;;
+    vmkit.gw=*) gw=${arg#vmkit.gw=} ;;
+    vmkit.probe=*) probes="$probes ${arg#vmkit.probe=}" ;;
+    vmkit.dns=*) names="$names ${arg#vmkit.dns=}" ;;
+    vmkit.spoof=*) spoof=${arg#vmkit.spoof=} ;;
+    vmkit.serve=*) serve=${arg#vmkit.serve=} ;;
+    vmkit.hold=*) hold=${arg#vmkit.hold=} ;;
   esac
 done
+probe() { # probe <label> <ip:port>
+  if /bin/busybox nc -w 3 "${2%:*}" "${2##*:}" </dev/null >/dev/null 2>&1; then r=open; else r=closed; fi
+  echo "VMKIT-PROBE $1 $2 $r"
+}
 end() {
   case $method in
     reboot) /bin/busybox reboot -f ;;
@@ -27,6 +44,28 @@ case $action in
   exit) exit 0 ;;  # PID 1 exiting panics the kernel
   idle) while :; do echo "VMKIT-GUEST-TICK"; /bin/busybox sleep 0.2; done ;;
   vsock) /bin/vsock-hello 1234; end ;;
+  net)
+    /bin/busybox ip link set lo up
+    /bin/busybox ip addr add "$ip" dev eth0
+    /bin/busybox ip link set eth0 up
+    /bin/busybox ip route add default via "$gw"
+    if [ -n "$serve" ]; then
+      /bin/busybox mkdir -p /srv && echo VMKIT-SERVED > /srv/index.html
+      /bin/busybox httpd -p "$serve" -h /srv && echo "VMKIT-SERVING $serve"
+    fi
+    for p in $probes; do probe tcp "$p"; done
+    for n in $names; do
+      if /bin/busybox nslookup "$n" "$gw" >/dev/null 2>&1; then r=ok; else r=fail; fi
+      echo "VMKIT-DNS $n $r"
+    done
+    if [ -n "$spoof" ]; then
+      # Send from an address the host did not assign (the route's preferred source).
+      /bin/busybox ip addr add "$spoof" dev eth0
+      /bin/busybox ip route replace default via "$gw" src "${spoof%/*}"
+      for p in $probes; do probe spoofed "$p"; done
+    fi
+    /bin/busybox sleep "$hold"
+    end ;;
   disks)
     for d in /sys/block/vd*; do echo "VMKIT-DISK $(/bin/busybox basename "$d") $(/bin/busybox cat "$d/size")"; done
     end ;;
