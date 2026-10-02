@@ -136,7 +136,12 @@ fn read_only_binds_stay_read_only_and_writable_ones_reach_the_host() {
     let Some(s) = Sandbox::new() else { return };
     // The temporary directory is on a nosuid,nodev tmpfs on most hosts: its locked flags must be kept.
     let o = s.output(&s.plan(&["sh", "-c", "echo x > /vm/data"]));
-    assert!(!o.status.success(), "wrote to a read-only bind");
+    // Refused by the read-only mount itself, not by a helper failure (exit 125).
+    assert!(!o.status.success() && o.status.code() != Some(125), "{o:?}");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("Read-only file system"),
+        "{o:?}"
+    );
     assert_eq!(std::fs::read_to_string(s.path("data")).unwrap(), "ro");
     let o = s.output(&s.plan(&["sh", "-c", "echo out > /vm/sock/out && echo x > /new"]));
     assert!(!o.status.success(), "the root is read-only");
@@ -176,6 +181,12 @@ fn the_vmm_has_no_privileges_and_dies_with_the_helper() {
         limits
             .lines()
             .any(|l| l.starts_with("Max open files") && l.contains(" 64 ")),
+        "{limits}"
+    );
+    assert!(
+        limits
+            .lines()
+            .any(|l| l.starts_with("Max processes") && l.contains(" 32 ")),
         "{limits}"
     );
     child.kill().unwrap();

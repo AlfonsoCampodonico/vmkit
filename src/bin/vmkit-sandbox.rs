@@ -24,13 +24,13 @@ fn main() {
 mod linux {
     use std::fs;
     use std::io::{BufRead, BufReader, Write};
-    use std::os::fd::AsFd;
+    use std::os::fd::{AsFd, AsRawFd};
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::{CommandExt, ExitStatusExt};
-    use std::path::Path;
+    use std::path::{Component, Path};
     use std::process::{Command, ExitStatus, Stdio};
 
-    use rustix::fs::{CWD, FileType, StatVfsMountFlags, fstat, statvfs};
+    use rustix::fs::{CWD, Dir, FileType, Mode, OFlags, fstat, openat, statvfs};
     use rustix::io::{FdFlags, fcntl_setfd};
     use rustix::mount::{
         MountFlags, MountPropagationFlags, MoveMountFlags, OpenTreeFlags, UnmountFlags, mount, mount_change,
@@ -73,6 +73,10 @@ mod linux {
     /// Unshares namespaces. This process is single-threaded and does not share its
     /// file-descriptor table, so the `unshare` safety requirement (no `FILES`) holds.
     fn unshare(flags: UnshareFlags) {
+        assert!(
+            !flags.contains(UnshareFlags::FILES),
+            "unshare must not be asked to unshare the descriptor table"
+        );
         #[allow(unsafe_code)]
         // SAFETY: `flags` never includes `UnshareFlags::FILES` (see the doc comment).
         let r = unsafe { rustix::thread::unshare_unsafe(flags) };
@@ -82,16 +86,25 @@ mod linux {
     /// Marks every inherited descriptor above stderr close-on-exec, so nothing the
     /// caller leaked reaches the VMM.
     fn close_inherited_fds() {
-        let fds: Vec<i32> = fs::read_dir("/proc/self/fd")
+        let dir = openat(
+            CWD,
+            "/proc/self/fd",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap_or_else(|e| fail("listing descriptors", e));
+        // The listing's own descriptor is open for the whole listing, so it is excluded by number.
+        let listing = dir.as_raw_fd();
+        let fds: Vec<i32> = Dir::new(dir)
             .unwrap_or_else(|e| fail("listing descriptors", e))
-            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-            .filter(|&fd| fd > 2)
+            .filter_map(|e| e.ok()?.file_name().to_str().ok()?.parse().ok())
+            .filter(|&fd| fd > 2 && fd != listing)
             .collect();
         for fd in fds {
             #[allow(unsafe_code)]
-            // SAFETY: `fd` was open when listed and nothing in this single-threaded process
-            // closes descriptors meanwhile; the one `read_dir` used for the listing is
-            // already closed, so setting a flag on that number fails harmlessly.
+            // SAFETY: `fd` was listed as open, is not the listing's own descriptor (which is
+            // closed by now), and nothing in this single-threaded process closes or opens
+            // descriptors between the listing and this call, so it still names an open descriptor.
             let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(fd) };
             let _ = fcntl_setfd(fd, FdFlags::CLOEXEC);
         }
@@ -123,6 +136,12 @@ mod linux {
         let plan = read_plan(plan_path);
         let uid = rustix::process::getuid().as_raw();
         let gid = rustix::process::getgid().as_raw();
+        if uid == 0 || rustix::process::geteuid().as_raw() == 0 {
+            fail(
+                "refusing to run as root",
+                "the VMM would keep every capability in its namespaces; run vmkit as an unprivileged user (kiln spec T6)",
+            );
+        }
         unshare(UnshareFlags::NEWUSER | UnshareFlags::NEWPID);
         // Identity-map the invoking user (no root inside the namespace).
         let write = |file: &str, data: String| {
@@ -167,7 +186,9 @@ mod linux {
     }
 
     /// Starts `pasta` on the VM's namespace. It returns once its interface is configured
-    /// and keeps running in the PID namespace, so it ends with the VMM.
+    /// and keeps running in the PID namespace, so it ends with the VMM. After it daemonizes
+    /// its daemon is a child of the VMM (PID 1), which never reaps it if it exits early; it
+    /// cannot outlive the PID namespace.
     fn attach_pasta(net: &NetPlan, pid: u32) {
         let status = Command::new(&net.pasta)
             .args(&net.pasta_args)
@@ -177,10 +198,8 @@ mod linux {
             .status()
             .unwrap_or_else(|e| fail(&format!("starting {}", net.pasta.display()), e));
         if !status.success() {
-            let _ = kill_process(
-                rustix::process::Pid::from_raw(pid as i32).expect("child pid"),
-                Signal::KILL,
-            );
+            let child = rustix::process::Pid::from_raw(pid as i32).unwrap_or_else(|| fail("child pid", pid));
+            let _ = kill_process(child, Signal::KILL);
             fail("pasta", format!("{} exited with {status}", net.pasta.display()));
         }
     }
@@ -255,13 +274,31 @@ mod linux {
         if !writable {
             // A user namespace cannot clear the source mount's locked flags, so keep them.
             let st = statvfs(target).unwrap_or_else(|e| fail(&format!("statvfs {}", target.display()), e));
-            let keep = StatVfsMountFlags::NOSUID
-                | StatVfsMountFlags::NODEV
-                | StatVfsMountFlags::NOEXEC
-                | StatVfsMountFlags::NOATIME
-                | StatVfsMountFlags::NODIRATIME
-                | StatVfsMountFlags::RELATIME;
-            let locked = MountFlags::from_bits_retain((st.f_flag & keep).bits() as u32);
+            // The kernel's ST_* values, which statvfs reports. (rustix's `StatVfsMountFlags::RELATIME`
+            // is MS_RELATIME, a different bit, so the flags are mapped explicitly.)
+            const ST_NOSUID: u64 = 0x2;
+            const ST_NODEV: u64 = 0x4;
+            const ST_NOEXEC: u64 = 0x8;
+            const ST_NOATIME: u64 = 0x400;
+            const ST_NODIRATIME: u64 = 0x800;
+            const ST_RELATIME: u64 = 0x1000;
+            let reported = st.f_flag.bits() as u64;
+            let mut locked = MountFlags::empty();
+            for (st_flag, flag) in [
+                (ST_NOSUID, MountFlags::NOSUID),
+                (ST_NODEV, MountFlags::NODEV),
+                (ST_NOEXEC, MountFlags::NOEXEC),
+                (ST_NOATIME, MountFlags::NOATIME),
+                (ST_NODIRATIME, MountFlags::NODIRATIME),
+                (ST_RELATIME, MountFlags::RELATIME),
+            ] {
+                if reported & st_flag != 0 {
+                    locked |= flag;
+                }
+            }
+            if !locked.intersects(MountFlags::NOATIME | MountFlags::RELATIME) {
+                locked |= MountFlags::STRICTATIME;
+            }
             mount_remount(
                 target,
                 MountFlags::BIND | MountFlags::RDONLY | MountFlags::NOSUID | locked,
@@ -275,6 +312,18 @@ mod linux {
         // If the outer helper dies, so does everything in this PID namespace.
         set_parent_process_death_signal(Some(Signal::KILL)).unwrap_or_else(|e| fail("pdeathsig", e));
         let plan = read_plan(plan_path);
+        for b in &plan.binds {
+            let plain = b.target.is_absolute()
+                && b.target
+                    .components()
+                    .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+            if !plain {
+                fail(
+                    &b.target.display().to_string(),
+                    "a bind target must be an absolute path without `.` or `..`",
+                );
+            }
+        }
         unshare(UnshareFlags::NEWNS | UnshareFlags::NEWNET);
         if let Some(net) = &plan.net {
             setup_net(net);
@@ -321,7 +370,7 @@ mod linux {
         fs::remove_dir("/old-root").unwrap_or_else(|e| fail("removing old-root", e));
         mount_remount("/", MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV, "")
             .unwrap_or_else(|e| fail("making the root read-only", e));
-        let lim = |r: Resource, n: u64| {
+        let lim = |r: Resource, what: &str, n: u64| {
             setrlimit(
                 r,
                 Rlimit {
@@ -329,10 +378,10 @@ mod linux {
                     maximum: Some(n),
                 },
             )
-            .unwrap_or_else(|e| fail("setrlimit", e))
+            .unwrap_or_else(|e| fail(&format!("limiting {what}"), e))
         };
-        lim(Resource::Nofile, plan.limits.open_files);
-        lim(Resource::Nproc, plan.limits.processes);
+        lim(Resource::Nofile, "open files", plan.limits.open_files);
+        lim(Resource::Nproc, "processes", plan.limits.processes);
         set_no_new_privs(true).unwrap_or_else(|e| fail("no_new_privs", e));
         // The VMM gets no capabilities: no ambient set, and exec as a non-root user.
         clear_ambient_capability_set().unwrap_or_else(|e| fail("clearing ambient capabilities", e));
