@@ -25,14 +25,19 @@ cp "$here/microvm-kernel-ci-$arch-$series.config" "$src/.config"
 (cd "$src" && ARCH=$karch scripts/kconfig/merge_config.sh -m .config "$here/fragments/base.config" "$here/fragments/base-$arch.config" >/dev/null \
   && make -s ARCH=$karch CROSS_COMPILE=$cross olddefconfig \
   && make -s ARCH=$karch CROSS_COMPILE=$cross -j"$(nproc)" "$(basename $image)")
-mkdir -p "$out"
-cp "$src/$image" "$out/vmlinux-$version-$arch"
-cp "$src/.config" "$out/config-$version-$arch"
-# Every fragment line must have survived olddefconfig.
+# Every fragment line must have survived olddefconfig; checked before anything lands in $out.
 missing=0
 for f in "$here/fragments/base.config" "$here/fragments/base-$arch.config"; do
   while IFS= read -r line; do
-    case $line in CONFIG_*=*) grep -qx "$line" "$src/.config" || { echo "missing: $line"; missing=1; } ;; esac
+    case $line in
+      CONFIG_*=*) grep -qx "$line" "$src/.config" || { echo "missing: $line"; missing=1; } ;;
+      "# CONFIG_"*" is not set")
+        opt=${line#\# }; opt=${opt%% *}
+        ! grep -q "^$opt=" "$src/.config" || { echo "still set: $opt"; missing=1; } ;;
+    esac
   done < "$f"
 done
-exit $missing
+[ "$missing" = 0 ] || exit 1
+mkdir -p "$out"
+cp "$src/$image" "$out/vmlinux-$version-$arch"
+cp "$src/.config" "$out/config-$version-$arch"

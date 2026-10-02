@@ -13,8 +13,10 @@ cat > "$work/fc.json" <<JSON
   "boot_args": "console=ttyS0 reboot=k $args vmkit.exit=reboot"},
  "drives": [], "machine-config": {"vcpu_count": 1, "mem_size_mib": 256}}
 JSON
-timeout 60 firecracker --no-api --config-file "$work/fc.json" > "$work/fc.log" 2>&1
-grep -q VMKIT-GUEST-UP "$work/fc.log" && echo "firecracker: guest booted and exited"
+timeout 60 firecracker --no-api --config-file "$work/fc.json" > "$work/fc.log" 2>&1 || { echo "firecracker failed"; cat "$work/fc.log"; exit 1; }
+grep -q VMKIT-GUEST-UP "$work/fc.log" || { echo "firecracker: no VMKIT-GUEST-UP"; cat "$work/fc.log"; exit 1; }
+echo "firecracker: guest booted and exited"
 timeout 60 cloud-hypervisor --kernel "$kernel" --initramfs "$initramfs" --cmdline "console=$ch_console $args vmkit.exit=poweroff" \
-  --cpus boot=1 --memory size=256M --serial tty --console off > "$work/ch.log" 2>&1
-grep -q VMKIT-GUEST-UP "$work/ch.log" && echo "cloud-hypervisor: guest booted and exited"
+  --cpus boot=1 --memory size=256M --serial tty --console off > "$work/ch.log" 2>&1 || { echo "cloud-hypervisor failed"; cat "$work/ch.log"; exit 1; }
+grep -q VMKIT-GUEST-UP "$work/ch.log" || { echo "cloud-hypervisor: no VMKIT-GUEST-UP"; cat "$work/ch.log"; exit 1; }
+echo "cloud-hypervisor: guest booted and exited"
