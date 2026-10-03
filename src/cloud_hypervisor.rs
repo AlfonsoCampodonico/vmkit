@@ -172,7 +172,7 @@ impl ChVm {
                 .disks
                 .iter()
                 .enumerate()
-                .map(|(n, d)| json!({"path": sandbox::disk(n), "readonly": d.read_only}))
+                .map(|(n, d)| disk_config(n, d))
                 .collect::<Vec<_>>(),
             // Guest serial on the VMM's stdout, which vmkit appends to the console log;
             // a `file=` serial would be truncated when the guest resets.
@@ -192,6 +192,12 @@ impl ChVm {
         }
         self.call("vm.create", Some(config))
     }
+}
+
+/// One entry of the `vm.create` disks. vmkit only supports raw images, so say so: left to
+/// autodetect, Cloud Hypervisor refuses writes to sector 0, which breaks ext4 superblocks.
+fn disk_config(n: usize, d: &crate::spec::Disk) -> serde_json::Value {
+    json!({"path": sandbox::disk(n), "readonly": d.read_only, "image_type": "Raw"})
 }
 
 impl Vm for ChVm {
@@ -289,6 +295,19 @@ mod tests {
         .map(|(p, a)| (p.to_string(), a.to_string()))
         .collect();
         assert_eq!(rules(&spec()), expected);
+    }
+
+    #[test]
+    fn every_disk_is_declared_raw() {
+        let s = spec();
+        let disks: Vec<_> = s.disks.iter().enumerate().map(|(n, d)| disk_config(n, d)).collect();
+        assert_eq!(
+            disks,
+            [
+                json!({"path": "/vm/disk/0", "readonly": true, "image_type": "Raw"}),
+                json!({"path": "/vm/disk/1", "readonly": false, "image_type": "Raw"}),
+            ]
+        );
     }
 
     #[test]
