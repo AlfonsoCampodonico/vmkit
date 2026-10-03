@@ -9,7 +9,9 @@ use serde_json::{Value, json};
 use crate::binary::{self, Version};
 use crate::error::{Error, Result};
 use crate::events;
-use crate::process::{self, Proc};
+use crate::net;
+use crate::process::Proc;
+use crate::sandbox;
 use crate::spec::{Capabilities, GuestExit, RestoreSpec, SnapshotBundle, VmEnd, VmSpec};
 use crate::vmm::{Vm, Vmm};
 
@@ -18,6 +20,8 @@ const NAME: &str = "cloud-hypervisor";
 
 pub struct CloudHypervisor {
     binary: PathBuf,
+    /// The sandbox helper every VMM runs under.
+    sandbox: PathBuf,
     arch: &'static str,
 }
 
@@ -28,6 +32,7 @@ impl CloudHypervisor {
         binary::check_version(&binary, NAME, MIN_VERSION)?;
         Ok(Self {
             binary,
+            sandbox: sandbox::find_helper()?,
             arch: std::env::consts::ARCH,
         })
     }
@@ -35,32 +40,19 @@ impl CloudHypervisor {
 
 /// Landlock rules: Cloud Hypervisor may touch only the VM's own files (kiln spec §9.2).
 fn landlock_rules(spec: &VmSpec) -> Vec<Value> {
-    let rule = |path: &Path, access: &str| json!({"path": path, "access": access});
-    let mut rules = vec![rule(&spec.kernel, "r")];
-    if let Some(i) = &spec.initramfs {
-        rules.push(rule(i, "r"));
+    let rule = |path: &str, access: &str| json!({"path": path, "access": access});
+    let mut rules = vec![rule(sandbox::KERNEL, "r")];
+    if spec.initramfs.is_some() {
+        rules.push(rule(sandbox::INITRAMFS, "r"));
     }
-    for d in &spec.disks {
-        rules.push(rule(&d.path, if d.read_only { "r" } else { "rw" }));
+    for (n, d) in spec.disks.iter().enumerate() {
+        rules.push(rule(&sandbox::disk(n), if d.read_only { "r" } else { "rw" }));
     }
-    rules.push(rule(&spec.run_dir, "rw"));
-    if let Some(n) = &spec.net {
-        // Opening a tap needs the tun device and reading its flags from sysfs.
-        rules.push(rule(Path::new("/dev/net/tun"), "rw"));
-        rules.push(rule(&Path::new("/sys/class/net").join(&n.tap), "r"));
+    rules.push(rule(sandbox::SOCK, "rw"));
+    if spec.net.is_some() {
+        rules.push(rule(sandbox::TUN, "rw"));
     }
     rules
-}
-
-/// Cloud Hypervisor splits `path=` option values on commas, so the run directory cannot have one.
-fn check_run_dir(spec: &VmSpec) -> Result<()> {
-    if spec.run_dir.to_string_lossy().contains(',') {
-        return Err(Error::InvalidSpec(format!(
-            "run_dir {} contains a comma, which Cloud Hypervisor's option parser cannot take",
-            spec.run_dir.display()
-        )));
-    }
-    Ok(())
 }
 
 /// The backstop thread: ends the VM on a guest reset, and kills the VMM if it can no longer watch.
@@ -98,9 +90,9 @@ impl Vmm for CloudHypervisor {
 
     fn create(&self, spec: &VmSpec) -> Result<Box<dyn Vm>> {
         spec.check(&self.capabilities())?;
-        check_run_dir(spec)?;
-        let api = spec.run_dir.join("cloud-hypervisor.sock");
-        let events = spec.run_dir.join("events.json");
+        let api = sandbox::host(spec, "cloud-hypervisor.sock");
+        let events = sandbox::host(spec, "events.json");
+        std::fs::create_dir_all(spec.run_dir.join("sock"))?;
         // A previous VM's events (say, its reset) must not reach this VM's backstop.
         match std::fs::remove_file(&events) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
@@ -108,17 +100,18 @@ impl Vmm for CloudHypervisor {
         }
         let args = vec![
             "--api-socket".into(),
-            format!("path={}", api.display()),
+            format!("path={}", sandbox::inside("cloud-hypervisor.sock")),
             "--event-monitor".into(),
-            format!("path={}", events.display()),
+            format!("path={}", sandbox::inside("events.json")),
             "--seccomp".into(),
             "true".into(),
         ];
         crate::process::clear_socket(&api)?;
-        let proc = process::spawn(
+        let proc = sandbox::spawn(
+            &self.sandbox,
             &self.binary,
             &args,
-            &spec.console_log,
+            spec,
             &spec.run_dir.join("cloud-hypervisor.log"),
         )?;
         // The backstop: a guest reset must end the VM, never reboot it (kiln spec §4.1).
@@ -167,15 +160,20 @@ impl ChVm {
     fn configure(&mut self, spec: &VmSpec, console: &str) -> Result<()> {
         let mut cmdline = spec.cmdline.clone();
         cmdline.push(format!("console={console}"));
-        let mut payload = json!({"kernel": spec.kernel, "cmdline": cmdline.join(" ")});
-        if let Some(i) = &spec.initramfs {
-            payload["initramfs"] = json!(i);
+        let mut payload = json!({"kernel": sandbox::KERNEL, "cmdline": cmdline.join(" ")});
+        if spec.initramfs.is_some() {
+            payload["initramfs"] = json!(sandbox::INITRAMFS);
         }
         let mut config = json!({
             "payload": payload,
             "cpus": {"boot_vcpus": spec.vcpus, "max_vcpus": spec.vcpus},
             "memory": {"size": u64::from(spec.memory_mib) << 20},
-            "disks": spec.disks.iter().map(|d| json!({"path": d.path, "readonly": d.read_only})).collect::<Vec<_>>(),
+            "disks": spec
+                .disks
+                .iter()
+                .enumerate()
+                .map(|(n, d)| json!({"path": sandbox::disk(n), "readonly": d.read_only}))
+                .collect::<Vec<_>>(),
             // Guest serial on the VMM's stdout, which vmkit appends to the console log;
             // a `file=` serial would be truncated when the guest resets.
             "serial": {"mode": "Tty"},
@@ -184,17 +182,13 @@ impl ChVm {
             "landlock_rules": landlock_rules(spec),
         });
         if let Some(v) = spec.vsock {
-            let socket = spec.run_dir.join("vsock.sock");
+            let socket = sandbox::host(spec, "vsock.sock");
             crate::process::clear_socket(&socket)?;
-            config["vsock"] = json!({"cid": v.guest_cid, "socket": socket});
+            config["vsock"] = json!({"cid": v.guest_cid, "socket": sandbox::inside("vsock.sock")});
             self.vsock = Some(socket);
         }
-        if let Some(n) = &spec.net {
-            let mut net = json!({"tap": n.tap});
-            if let Some(mac) = &n.guest_mac {
-                net["mac"] = json!(mac);
-            }
-            config["net"] = json!([net]);
+        if spec.net.is_some() {
+            config["net"] = json!([{"tap": net::TAP, "mac": net::GUEST_MAC}]);
         }
         self.call("vm.create", Some(config))
     }
@@ -248,7 +242,8 @@ impl Drop for ChVm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{Disk, NetSpec};
+    use crate::net::NetSpec;
+    use crate::spec::Disk;
 
     fn spec() -> VmSpec {
         VmSpec {
@@ -283,40 +278,23 @@ mod tests {
 
     #[test]
     fn landlock_allows_only_the_vms_own_files() {
-        let r = rules(&spec());
-        let expected: Vec<(&str, &str)> = vec![
-            ("/k/vmlinux", "r"),
-            ("/k/initramfs", "r"),
-            ("/d/ro.img", "r"),
-            ("/d/rw.img", "rw"),
-            ("/run/vm", "rw"),
-        ];
-        assert_eq!(
-            r,
-            expected
-                .iter()
-                .map(|(p, a)| (p.to_string(), a.to_string()))
-                .collect::<Vec<_>>()
-        );
+        let expected: Vec<(String, String)> = [
+            ("/vm/kernel", "r"),
+            ("/vm/initramfs", "r"),
+            ("/vm/disk/0", "r"),
+            ("/vm/disk/1", "rw"),
+            ("/vm/sock", "rw"),
+        ]
+        .iter()
+        .map(|(p, a)| (p.to_string(), a.to_string()))
+        .collect();
+        assert_eq!(rules(&spec()), expected);
     }
 
     #[test]
-    fn landlock_allows_the_tap_device_when_there_is_a_nic() {
+    fn landlock_allows_the_tun_device_when_there_is_a_nic() {
         let mut s = spec();
-        s.net = Some(NetSpec {
-            tap: "vmkt0".into(),
-            guest_mac: None,
-        });
-        let r = rules(&s);
-        assert!(r.contains(&("/dev/net/tun".into(), "rw".into())), "{r:?}");
-        assert!(r.contains(&("/sys/class/net/vmkt0".into(), "r".into())), "{r:?}");
-    }
-
-    #[test]
-    fn a_comma_in_the_run_dir_is_refused() {
-        let mut s = spec();
-        assert!(check_run_dir(&s).is_ok());
-        s.run_dir = "/run/a,b".into();
-        assert!(matches!(check_run_dir(&s), Err(Error::InvalidSpec(_))));
+        s.net = Some(NetSpec::default());
+        assert!(rules(&s).contains(&("/dev/net/tun".into(), "rw".into())));
     }
 }

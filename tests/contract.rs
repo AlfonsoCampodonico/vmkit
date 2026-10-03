@@ -12,7 +12,7 @@ use std::os::unix::net::UnixListener;
 use std::time::{Duration, Instant};
 
 use common::{Case, END};
-use vmkit::{Backend, Disk, EndReason, Error, GuestExit, NetSpec, VsockSpec};
+use vmkit::{Backend, Disk, EndReason, Error, GuestExit, VsockSpec};
 
 fn boots_and_ends_with_the_exit_method(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
@@ -64,7 +64,7 @@ fn kill_ends_the_vmm_and_its_api(backend: Backend) {
         .unwrap()
         .expect("killed VMM is reaped");
     assert_eq!((end.reason, end.signal), (EndReason::Killed, Some(9)));
-    let api = std::fs::read_dir(c.dir.path())
+    let api = std::fs::read_dir(c.dir.path().join("sock"))
         .unwrap()
         .map(|e| e.unwrap().path())
         .find(|p| p.extension().is_some_and(|x| x == "sock") && !p.ends_with("vsock.sock"))
@@ -156,18 +156,126 @@ fn guest_vsock_connections_reach_the_host_socket(backend: Backend) {
     assert!(c.console().contains("VMKIT-VSOCK-REPLY HOST-ACK"), "{}", c.console());
 }
 
-/// Needs `VMKIT_TEST_TAP` to name an existing tap the test user may open; otherwise it returns early,
-/// even under VMKIT_REQUIRE_KVM_TESTS (automatic network tests arrive with M2b).
-fn a_tap_backed_nic_boots(backend: Backend) {
-    let Ok(tap) = std::env::var("VMKIT_TEST_TAP") else {
-        return;
-    };
+fn a_symlinked_disk_is_refused(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
-    let mut spec = c.spec("up");
-    spec.net = Some(NetSpec { tap, guest_mac: None });
-    let (_vm, end) = c.run(&spec);
+    let mut spec = c.spec("disks");
+    let real = c.dir.path().join("real.img");
+    std::fs::File::create(&real).unwrap().set_len(4096).unwrap();
+    let link = c.dir.path().join("link.img");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    spec.disks.push(Disk {
+        path: link,
+        read_only: true,
+    });
+    let err = c.vmm.create(&spec).err().expect("a symlink is never followed");
+    assert!(matches!(&err, Error::EarlyExit(m) if m.contains("link.img")), "{err}");
+}
+
+fn a_run_dir_with_a_comma_boots(backend: Backend) {
+    let Some(mut c) = Case::new(backend) else { return };
+    // The VMM sees only /vm/sock, so host paths no longer reach Cloud Hypervisor's option parser.
+    c.dir = tempfile::Builder::new().prefix("vm,dir").tempdir().unwrap();
+    let (_vm, end) = c.run(&c.spec("up"));
     assert_eq!(end.reason, EndReason::Exited, "{end:?}\n{}", c.tail());
-    assert_eq!(c.console().matches("VMKIT-GUEST-UP").count(), 1, "{}", c.console());
+}
+
+/// Every path under `dir`, relative to it, without descending into `/vm/sock`.
+fn walk(dir: &std::path::Path, rel: &str, out: &mut Vec<String>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = format!("{rel}/{}", entry.file_name().to_string_lossy());
+        out.push(path.clone());
+        if entry.file_type().unwrap().is_dir() && path != "/vm/sock" {
+            walk(&entry.path(), &path, out);
+        }
+    }
+}
+
+fn status_field(status: &str, field: &str) -> String {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{field}:")))
+        .unwrap_or_else(|| panic!("no {field} in status"))
+        .trim()
+        .to_string()
+}
+
+fn the_vmm_sees_only_its_own_files_and_holds_no_privileges(backend: Backend) {
+    let Some(c) = Case::new(backend) else { return };
+    let mut spec = c.spec("idle");
+    let disk = c.dir.path().join("disk.img");
+    std::fs::File::create(&disk).unwrap().set_len(4096).unwrap();
+    spec.disks.push(Disk {
+        path: disk,
+        read_only: true,
+    });
+    let mut vm = c.vmm.create(&spec).unwrap();
+    vm.start().unwrap();
+    c.await_console("VMKIT-GUEST-TICK", 1);
+    let pid = std::fs::read_to_string(vmkit::sandbox::pid_file(c.dir.path())).unwrap();
+    let proc_dir = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
+
+    let mut seen = Vec::new();
+    walk(&proc_dir.join("root"), "", &mut seen);
+    seen.sort();
+    let expected = [
+        "/dev",
+        "/dev/kvm",
+        "/dev/null",
+        "/dev/urandom",
+        "/vm",
+        "/vm/disk",
+        "/vm/disk/0",
+        "/vm/initramfs",
+        "/vm/kernel",
+        "/vm/sock",
+        "/vmm",
+    ];
+    assert_eq!(seen, expected);
+
+    let status = std::fs::read_to_string(proc_dir.join("status")).unwrap();
+    let uid = rustix_free_uid();
+    assert_eq!(status_field(&status, "Uid"), format!("{uid}\t{uid}\t{uid}\t{uid}"));
+    for caps in ["CapInh", "CapPrm", "CapEff", "CapAmb"] {
+        assert_eq!(status_field(&status, caps), "0000000000000000", "{caps}");
+    }
+    assert_eq!(status_field(&status, "NoNewPrivs"), "1");
+    assert!(
+        status_field(&status, "NSpid").ends_with("\t1"),
+        "PID 1 of its own namespace"
+    );
+    let limits = std::fs::read_to_string(proc_dir.join("limits")).unwrap();
+    assert!(
+        limits
+            .lines()
+            .any(|l| l.starts_with("Max open files") && l.split_whitespace().nth(3) == Some("1024")),
+        "{limits}"
+    );
+    // Each backend filters some of its threads (Cloud Hypervisor per thread, not the main one).
+    let filtered = std::fs::read_dir(proc_dir.join("task")).unwrap().any(|t| {
+        let status = std::fs::read_to_string(t.unwrap().path().join("status")).unwrap_or_default();
+        status_field(&status, "Seccomp") == "2"
+    });
+    assert!(filtered, "no VMM thread runs under seccomp");
+    if vmkit::cgroups_available() {
+        let cgroup = std::fs::read_to_string(proc_dir.join("cgroup")).unwrap();
+        let path = cgroup.trim().strip_prefix("0::").expect("cgroup v2");
+        let max = std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.max")).unwrap();
+        assert_eq!(max.trim(), ((256u64 + 256) << 20).to_string());
+    }
+    vm.kill().unwrap();
+    vm.wait().unwrap();
+    assert!(!proc_dir.exists(), "the VMM is gone once the VM ended");
+}
+
+/// The invoking user's uid, from `/proc/self/status`.
+fn rustix_free_uid() -> String {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    status_field(&status, "Uid")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string()
 }
 
 macro_rules! contract {
@@ -189,5 +297,7 @@ contract!(
     disks_attach_in_order,
     device_budget_is_enforced_before_any_vmm_starts,
     guest_vsock_connections_reach_the_host_socket,
-    a_tap_backed_nic_boots,
+    the_vmm_sees_only_its_own_files_and_holds_no_privileges,
+    a_symlinked_disk_is_refused,
+    a_run_dir_with_a_comma_boots,
 );
