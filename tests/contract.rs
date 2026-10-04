@@ -7,7 +7,7 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixListener;
 use std::time::{Duration, Instant};
 
@@ -96,6 +96,24 @@ fn disks_attach_in_order(backend: Backend) {
         .filter_map(|l| l.trim().strip_prefix("VMKIT-DISK ").map(String::from))
         .collect();
     assert_eq!(disks, ["vda 8", "vdb 16", "vdc 24"]);
+}
+
+fn a_guest_can_write_sector_0_of_a_writable_disk(backend: Backend) {
+    let Some(c) = Case::new(backend) else { return };
+    let mut spec = c.spec("sector0");
+    let path = c.dir.path().join("disk.img");
+    std::fs::File::create(&path).unwrap().set_len(1 << 20).unwrap();
+    spec.disks.push(Disk {
+        path: path.clone(),
+        read_only: false,
+    });
+    let (_vm, end) = c.run(&spec);
+    assert_eq!(end.reason, EndReason::Exited, "{end:?}\n{}", c.tail());
+    assert!(c.console().contains("VMKIT-SECTOR0 ok"), "{}", c.tail());
+    let pattern: Vec<u8> = b"VMKIT-SECTOR0-PATTERN\n".iter().copied().cycle().take(512).collect();
+    let mut first = [0u8; 512];
+    std::fs::File::open(&path).unwrap().read_exact(&mut first).unwrap();
+    assert_eq!(first[..], pattern[..], "sector 0 on the host");
 }
 
 fn device_budget_is_enforced_before_any_vmm_starts(backend: Backend) {
@@ -295,6 +313,7 @@ contract!(
     a_panic_ends_the_vm,
     kill_ends_the_vmm_and_its_api,
     disks_attach_in_order,
+    a_guest_can_write_sector_0_of_a_writable_disk,
     device_budget_is_enforced_before_any_vmm_starts,
     guest_vsock_connections_reach_the_host_socket,
     the_vmm_sees_only_its_own_files_and_holds_no_privileges,

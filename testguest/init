@@ -1,6 +1,6 @@
 #!/bin/busybox sh
 # vmkit contract-suite guest. Kernel arguments:
-#   vmkit.test=<action>  up | reboot | panic | exit | idle | vsock | disks | net
+#   vmkit.test=<action>  up | reboot | panic | exit | idle | vsock | disks | sector0 | net
 #   vmkit.exit=<method>  poweroff | reboot  (how "up", "vsock", "disks" and "net" end)
 #   vmkit.ip=<addr/len> vmkit.gw=<addr>  configure eth0 (with vmkit.test=net)
 #   vmkit.probe=<ip>:<port>  try a TCP connection (repeatable)
@@ -44,6 +44,14 @@ case $action in
   exit) exit 0 ;;  # PID 1 exiting panics the kernel
   idle) while :; do echo "VMKIT-GUEST-TICK"; /bin/busybox sleep 0.2; done ;;
   vsock) /bin/vsock-hello 1234; end ;;
+  sector0)
+    # Write a known 512-byte pattern to sector 0 of the first (writable) disk and read it back.
+    /bin/busybox yes VMKIT-SECTOR0-PATTERN | /bin/busybox head -c 512 > /pattern
+    /bin/busybox dd if=/pattern of=/dev/vda bs=512 count=1 conv=fsync 2>/dev/null
+    /bin/busybox dd if=/dev/vda of=/readback bs=512 count=1 iflag=direct 2>/dev/null
+    if /bin/busybox cmp /pattern /readback; then r=ok; else r=fail; fi
+    echo "VMKIT-SECTOR0 $r"
+    end ;;
   net)
     /bin/busybox ip link set lo up
     /bin/busybox ip addr add "$ip" dev eth0
