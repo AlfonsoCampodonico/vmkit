@@ -760,7 +760,25 @@ mod linux {
     /// As PID 1: starts the program, reaps every process until the program ends, reports how it
     /// ended on `control`, and ends the same way (which ends everything else in the namespace).
     fn supervise(plan: &Plan, control: UnixStream) -> ! {
-        let Some(program) = fork() else { exec_program(plan) };
+        // Nothing in the namespace may trace or inspect init (Review Focus 1): the program
+        // shares its uid, and a dumpable init would be open to it.
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+            .unwrap_or_else(|e| fail("making init undumpable", e));
+        let nest = plan
+            .spec
+            .nest
+            .then(|| UnixStream::pair().unwrap_or_else(|e| fail("socketpair", e)));
+        let Some(program) = fork() else {
+            if let Some((ours, theirs)) = nest {
+                drop(ours);
+                enter_nested_namespace(theirs);
+            }
+            exec_program(plan)
+        };
+        if let Some((ours, theirs)) = nest {
+            drop(theirs);
+            map_nested_namespace(plan, program, ours);
+        }
         let status = loop {
             match rustix::process::waitpid(None, rustix::process::WaitOptions::empty()) {
                 Ok(Some((pid, status))) if pid == program => break status,
@@ -778,6 +796,46 @@ mod linux {
         let _ = (&control).write_all(report.as_bytes());
         drop(control);
         std::process::exit(status.code().unwrap_or(128 + status.signal().unwrap_or(0)));
+    }
+
+    /// In the program's process: a user namespace of its own, mapped by `init` from outside. It
+    /// holds no capability over the sandbox's namespaces, and creates no namespaces itself.
+    fn enter_nested_namespace(control: UnixStream) {
+        unshare(UnshareFlags::NEWUSER);
+        (&control)
+            .write_all(b"unshared\n")
+            .unwrap_or_else(|e| fail("signalling the nested namespace", e));
+        let mut line = String::new();
+        BufReader::new(&control)
+            .read_line(&mut line)
+            .unwrap_or_else(|e| fail("waiting for the nested id maps", e));
+        if line != "mapped\n" {
+            fail("waiting for the nested id maps", "init went away");
+        }
+        drop(control);
+        fs::write("/proc/sys/user/max_user_namespaces", "0")
+            .unwrap_or_else(|e| fail("writing /proc/sys/user/max_user_namespaces", e));
+    }
+
+    /// In init: maps every id of the sandbox, unchanged, into the program's namespace.
+    fn map_nested_namespace(plan: &Plan, program: rustix::process::Pid, control: UnixStream) {
+        let mut lines = BufReader::new(&control);
+        let mut line = String::new();
+        if lines.read_line(&mut line).is_err() || line != "unshared\n" {
+            fail("the nested namespace", "the program's process went away");
+        }
+        // One extent per extent of the sandbox's own map: the kernel maps each extent through a
+        // single extent of the parent's map, and root (the caller) and 1..=count (subordinate ids)
+        // are two of them.
+        let count = plan.subid.as_ref().map_or(0, |s| s.count);
+        let pid = program.as_raw_nonzero();
+        for map in ["uid_map", "gid_map"] {
+            let file = format!("/proc/{pid}/{map}");
+            fs::write(&file, format!("0 0 1\n1 1 {count}\n")).unwrap_or_else(|e| fail(&format!("writing {file}"), e));
+        }
+        (&control)
+            .write_all(b"mapped\n")
+            .unwrap_or_else(|e| fail("signalling the nested id maps", e));
     }
 
     /// Becomes the program: its ids, working directory and no new privileges, then exec.

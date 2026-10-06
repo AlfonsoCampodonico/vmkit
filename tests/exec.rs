@@ -413,3 +413,52 @@ fn the_overlay_root_has_proc_dev_and_shm_and_mounts() {
     );
     assert!(!t.path("upper/dev").exists(), "/dev's contents reached the upper");
 }
+
+impl Fixture {
+    fn run_overlay_nested(&self, script: &str) -> Out {
+        let mut s = self.overlay_spec(script);
+        s.nest = true;
+        self.output(&s)
+    }
+}
+
+#[test]
+fn without_nesting_root_in_the_sandbox_holds_its_namespaces() {
+    // The control for the next test: the same probes succeed for an un-nested root.
+    let Some(t) = Fixture::new() else { return };
+    let out = t.run_overlay(
+        "ip link add d0 type dummy && mount -t tmpfs t /tmp && echo holds",
+        Vec::new(),
+    );
+    assert_eq!(out.stdout, "holds\n", "{}", out.stderr);
+}
+
+#[test]
+fn a_nested_program_cannot_touch_the_sandboxs_namespaces() {
+    let Some(t) = Fixture::new() else { return };
+    let script = "id -u; ! ip link add d0 type dummy 2>/dev/null && ! mount -t tmpfs t /tmp 2>/dev/null \
+                  && ! unshare -U true 2>/dev/null && echo contained";
+    let out = t.run_overlay_nested(script);
+    assert_eq!(out.stdout, "0\ncontained\n", "{}", out.stderr);
+}
+
+#[test]
+fn a_nested_program_still_owns_files_as_root_and_subordinate_users() {
+    let Some(t) = Fixture::new() else { return };
+    let out = t.run_overlay_nested("touch /a && chown 1000:1000 /a && cat /proc/self/uid_map");
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout.split_whitespace().collect::<Vec<_>>(),
+        ["0", "0", "1", "1", "1", "65536"]
+    );
+    let meta = std::fs::symlink_metadata(t.path("upper/a")).unwrap();
+    assert_eq!(meta.uid(), t.subuid_start() + 999);
+}
+
+#[test]
+fn a_nested_program_cannot_signal_or_inspect_init() {
+    let Some(t) = Fixture::new() else { return };
+    let script = "kill -KILL 1; sleep 0.2; echo alive; cat /proc/1/environ >/dev/null 2>&1 || echo protected";
+    let out = t.run_overlay_nested(script);
+    assert_eq!(out.stdout, "alive\nprotected\n", "{}", out.stderr);
+}
