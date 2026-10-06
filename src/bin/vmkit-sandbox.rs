@@ -35,7 +35,8 @@ mod linux {
     use rustix::fs::{CWD, Dir, FileType, Mode, OFlags, fstat, openat, statvfs};
     use rustix::io::{FdFlags, fcntl_setfd};
     use rustix::mount::{
-        MountFlags, MountPropagationFlags, MoveMountFlags, OpenTreeFlags, UnmountFlags, mount, mount_change,
+        FsMountFlags, FsOpenFlags, MountAttrFlags, MountFlags, MountPropagationFlags, MoveMountFlags, OpenTreeFlags,
+        UnmountFlags, fsconfig_create, fsconfig_set_flag, fsconfig_set_string, fsmount, fsopen, mount, mount_change,
         mount_remount, move_mount, open_tree, unmount,
     };
     use rustix::process::{Gid, Uid};
@@ -547,7 +548,11 @@ mod linux {
                 host_root(root);
                 false
             }
-            Root::Overlay { .. } => fail("Root::Overlay", "not implemented yet"),
+            Root::Overlay { lowers, upper, work } => {
+                overlay_root(root, lowers, upper, work);
+                container_mounts(root, plan.subid.is_some());
+                true
+            }
         };
         for m in &plan.spec.mounts {
             match m {
@@ -630,6 +635,113 @@ mod linux {
             None,
         )
         .unwrap_or_else(|e| fail("mounting /proc", e));
+    }
+
+    /// An overlay of `lowers` (top first), `upper` and `work` on `root`, with user xattrs.
+    fn overlay_root(root: &Path, lowers: &[std::path::PathBuf], upper: &Path, work: &Path) {
+        let fs = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC).unwrap_or_else(|e| fail("opening overlayfs", e));
+        let set = |key: &str, value: &Path| {
+            fsconfig_set_string(&fs, key, value).map_err(|e| (format!("overlay {key} {}", value.display()), e))
+        };
+        // One `lowerdir+` per layer (Linux 6.8), in `lowerdir=` order: the first is the top. It
+        // takes paths of any length; a single `lowerdir=` string is bounded by a page.
+        let per_layer = lowers.iter().try_for_each(|l| set("lowerdir+", l));
+        match per_layer {
+            Ok(()) => {
+                set("upperdir", upper)
+                    .and_then(|()| set("workdir", work))
+                    .unwrap_or_else(|(what, e)| fail(&what, e));
+                fsconfig_set_flag(&fs, "userxattr").unwrap_or_else(|e| fail("overlay userxattr", e));
+                fsconfig_create(&fs).unwrap_or_else(|e| fail("creating the overlay", e));
+                let mnt = fsmount(&fs, FsMountFlags::FSMOUNT_CLOEXEC, MountAttrFlags::empty())
+                    .unwrap_or_else(|e| fail("mounting the overlay", e));
+                move_mount(&mnt, "", CWD, root, MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH)
+                    .unwrap_or_else(|e| fail("attaching the overlay", e));
+            }
+            Err((_, rustix::io::Errno::INVAL)) => {
+                let joined: Vec<String> = lowers.iter().map(|l| l.display().to_string()).collect();
+                let options = format!(
+                    "lowerdir={},upperdir={},workdir={},userxattr",
+                    joined.join(":"),
+                    upper.display(),
+                    work.display()
+                );
+                if options.len() > 4000 {
+                    fail(
+                        "the overlay",
+                        "too many layers for this kernel (Linux 6.8 lifts the limit)",
+                    );
+                }
+                let options = std::ffi::CString::new(options).unwrap_or_else(|e| fail("overlay options", e));
+                mount(
+                    "overlay",
+                    root,
+                    "overlay",
+                    MountFlags::empty(),
+                    Some(options.as_c_str()),
+                )
+                .unwrap_or_else(|e| fail("mounting the overlay", e));
+            }
+            Err((what, e)) => fail(&what, e),
+        }
+    }
+
+    /// `/proc`, a read-only `/sys`, and a `/dev` with the host's null, zero, full, random,
+    /// urandom and tty, a devpts of its own and a shm tmpfs. `tty_group`: gid 5 is mapped.
+    fn container_mounts(root: &Path, tty_group: bool) {
+        let at = |p: &str| {
+            let dir = root.join(p);
+            fs::create_dir_all(&dir).unwrap_or_else(|e| fail(&format!("mkdir /{p}"), e));
+            dir
+        };
+        let mount_at = |source: &str, p: &str, fstype: &str, flags: MountFlags, options: &str| {
+            let options = std::ffi::CString::new(options).unwrap_or_else(|e| fail("mount options", e));
+            mount(source, at(p), fstype, flags, Some(options.as_c_str()))
+                .unwrap_or_else(|e| fail(&format!("mounting /{p}"), e));
+        };
+        let hardened = MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC;
+        mount_at("proc", "proc", "proc", hardened, "");
+        mount_at("sysfs", "sys", "sysfs", hardened | MountFlags::RDONLY, "");
+        mount_at(
+            "tmpfs",
+            "dev",
+            "tmpfs",
+            MountFlags::NOSUID | MountFlags::NOEXEC,
+            "mode=0755,size=64k",
+        );
+        for d in ["null", "zero", "full", "random", "urandom", "tty"] {
+            let host = Path::new("/dev").join(d);
+            attach(&host, &root.join("dev").join(d), true, true);
+        }
+        for (link, target) in [
+            ("fd", "/proc/self/fd"),
+            ("stdin", "/proc/self/fd/0"),
+            ("stdout", "/proc/self/fd/1"),
+            ("stderr", "/proc/self/fd/2"),
+            ("ptmx", "pts/ptmx"),
+        ] {
+            std::os::unix::fs::symlink(target, root.join("dev").join(link))
+                .unwrap_or_else(|e| fail(&format!("linking /dev/{link}"), e));
+        }
+        let pts = if tty_group {
+            "newinstance,ptmxmode=0666,mode=0620,gid=5"
+        } else {
+            "newinstance,ptmxmode=0666,mode=0620"
+        };
+        mount_at(
+            "devpts",
+            "dev/pts",
+            "devpts",
+            MountFlags::NOSUID | MountFlags::NOEXEC,
+            pts,
+        );
+        mount_at(
+            "tmpfs",
+            "dev/shm",
+            "tmpfs",
+            MountFlags::NOSUID | MountFlags::NODEV,
+            "mode=1777,size=64m",
+        );
     }
 
     /// Forks this single-threaded process; `None` in the child.

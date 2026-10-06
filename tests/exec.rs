@@ -139,6 +139,52 @@ impl Fixture {
         }
     }
 
+    /// A busybox root at `name`: `bin/busybox`, its applets as symlinks, `etc/old` holding
+    /// `content`, and the mount points the overlay root uses.
+    fn rootfs(&self, name: &str, content: &str) -> PathBuf {
+        let root = self.path(name);
+        for d in ["bin", "etc", "proc", "sys", "dev", "tmp"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::copy(BUSYBOX, root.join("bin/busybox")).unwrap();
+        for applet in [
+            "sh", "ls", "cat", "rm", "mkdir", "touch", "chown", "id", "env", "sleep", "mount", "ip", "unshare", "kill",
+        ] {
+            std::os::unix::fs::symlink("busybox", root.join("bin").join(applet)).unwrap();
+        }
+        std::fs::write(root.join("etc/old"), content).unwrap();
+        root
+    }
+
+    /// `/bin/sh -c script` in an overlay of the fixture's busybox root.
+    fn overlay_spec(&self, script: &str) -> Spec {
+        let lower = self.rootfs("lower", "lower\n");
+        for d in ["upper", "work"] {
+            std::fs::create_dir(self.path(d)).unwrap();
+        }
+        self.base(
+            Command {
+                program: Program::Path("/bin/sh".into()),
+                arg0: None,
+                args: vec!["-c".into(), script.into()],
+                env: Some(vec![("PATH".into(), "/bin".into())]),
+                cwd: "/".into(),
+                user: None,
+            },
+            Root::Overlay {
+                lowers: vec![lower],
+                upper: self.path("upper"),
+                work: self.path("work"),
+            },
+        )
+    }
+
+    fn run_overlay(&self, script: &str, mounts: Vec<Mount>) -> Out {
+        let mut s = self.overlay_spec(script);
+        s.mounts = mounts;
+        self.output(&s)
+    }
+
     fn output(&self, spec: &Spec) -> Out {
         let o = sandbox::spawn(spec, sandbox::Stdio::piped())
             .unwrap()
@@ -150,6 +196,13 @@ impl Fixture {
             stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
         }
     }
+}
+
+fn xattr(path: &std::path::Path, name: &str) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; 256];
+    let n = rustix::fs::lgetxattr(path, name, &mut buf).ok()?;
+    buf.truncate(n);
+    Some(buf)
 }
 
 #[test]
@@ -279,4 +332,84 @@ fn a_bind_target_must_exist_in_the_host_root() {
     );
     assert_eq!(out.status.code(), Some(125));
     assert!(out.stderr.contains("must exist"), "{}", out.stderr);
+}
+
+#[test]
+fn an_overlay_root_records_changes_in_the_upper_with_user_xattrs() {
+    let Some(t) = Fixture::new() else { return };
+    let script = "rm /etc/old && mkdir -p /opt/new && echo hi >/opt/new/f && chown 1000:1000 /opt/new/f \
+                  && rm -r /etc && mkdir /etc && echo x >/etc/fresh";
+    let out = t.run_overlay(script, Vec::new());
+    assert!(out.status.success(), "{}", out.stderr);
+    let upper = t.path("upper");
+    assert_eq!(std::fs::read_to_string(upper.join("opt/new/f")).unwrap(), "hi\n");
+    // `etc` was replaced: an opaque directory, marked with a user xattr, never a trusted one.
+    assert_eq!(
+        xattr(&upper.join("etc"), "user.overlay.opaque").as_deref(),
+        Some(&b"y"[..])
+    );
+    assert!(xattr(&upper.join("etc"), "trusted.overlay.opaque").is_none());
+    let meta = std::fs::symlink_metadata(upper.join("opt/new/f")).unwrap();
+    assert_eq!(meta.uid(), t.subuid_start() + 999);
+    assert_eq!(
+        std::fs::read_to_string(t.path("lower/etc/old")).unwrap(),
+        "lower\n",
+        "a lower changed"
+    );
+}
+
+#[test]
+fn deleting_a_lower_file_leaves_a_whiteout() {
+    use std::os::unix::fs::FileTypeExt;
+    let Some(t) = Fixture::new() else { return };
+    let out = t.run_overlay("rm /bin/ls", Vec::new());
+    assert!(out.status.success(), "{}", out.stderr);
+    let meta = std::fs::symlink_metadata(t.path("upper/bin/ls")).unwrap();
+    assert!(meta.file_type().is_char_device() && meta.rdev() == 0, "{meta:?}");
+}
+
+#[test]
+fn the_first_lower_is_the_top_one() {
+    let Some(t) = Fixture::new() else { return };
+    let mut s = t.overlay_spec("cat /etc/old");
+    let top = t.rootfs("top", "top\n");
+    let Root::Overlay { lowers, .. } = &mut s.root else {
+        unreachable!()
+    };
+    lowers.insert(0, top);
+    let out = t.output(&s);
+    assert_eq!(out.stdout, "top\n", "{}", out.stderr);
+}
+
+#[test]
+fn the_overlay_root_has_proc_dev_and_shm_and_mounts() {
+    let Some(t) = Fixture::new() else { return };
+    let cache = t.path("cache");
+    std::fs::create_dir(&cache).unwrap();
+    let script = "test -c /dev/null && echo x >/dev/null && test -d /proc/self && test -d /dev/shm \
+                  && touch /dev/shm/a && test -e /dev/pts/ptmx && touch /cache/hit && touch /run/secrets/s \
+                  && ! touch /sys/x 2>/dev/null";
+    let mounts = vec![
+        Mount::Bind {
+            source: cache.clone(),
+            target: "/cache".into(),
+            writable: true,
+        },
+        Mount::Tmpfs {
+            target: "/run/secrets".into(),
+            size_mib: 1,
+        },
+    ];
+    let out = t.run_overlay(script, mounts);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(cache.join("hit").exists());
+    assert!(
+        !t.path("upper/cache/hit").exists(),
+        "a bind mount's writes reached the upper"
+    );
+    assert!(
+        !t.path("upper/run/secrets/s").exists(),
+        "a tmpfs's writes reached the upper"
+    );
+    assert!(!t.path("upper/dev").exists(), "/dev's contents reached the upper");
 }

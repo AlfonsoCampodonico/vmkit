@@ -544,9 +544,6 @@ fn resolve_subids(count: u32) -> Result<SubidPlan> {
 #[doc(hidden)]
 pub fn plan(spec: &Spec) -> Result<Plan> {
     spec.check().map_err(Error::InvalidSpec)?;
-    if matches!(spec.root, Root::Overlay { .. }) {
-        return Err(Error::Unsupported("overlay roots"));
-    }
     if spec.seccomp {
         return Err(Error::Unsupported("seccomp for sandboxed programs"));
     }
