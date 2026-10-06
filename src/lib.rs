@@ -12,6 +12,7 @@ mod process;
 #[doc(hidden)]
 pub mod sandbox;
 mod spec;
+mod subid;
 mod vmm;
 
 pub use cloud_hypervisor::CloudHypervisor;

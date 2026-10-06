@@ -32,6 +32,8 @@ pub enum Error {
     TooManyDevices { requested: u32, available: u32 },
     #[error("invalid VM spec: {0}")]
     InvalidSpec(String),
+    #[error("missing prerequisite: {0}")]
+    Prerequisite(String),
     #[error("{0} is not supported yet")]
     Unsupported(&'static str),
     #[error("the VMM exited before it was ready ({0})")]

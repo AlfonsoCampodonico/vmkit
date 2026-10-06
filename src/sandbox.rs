@@ -12,7 +12,7 @@
 use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{ChildStderr, ChildStdin, ChildStdout, ExitStatus};
+use std::process::{ChildStderr, ChildStdout, ExitStatus};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ use crate::error::{Error, Result};
 use crate::net::{self, NetSpec};
 use crate::process::{self, Proc};
 use crate::spec::VmSpec;
+use crate::subid;
 
 /// What the sandbox runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,27 +238,25 @@ impl Spec {
     }
 }
 
-/// The caller's three standard streams for the program.
+/// The program's output streams. Its stdin is always `/dev/null`: the helper's stages talk
+/// to each other over their standard input.
 pub struct Stdio {
-    pub stdin: std::process::Stdio,
     pub stdout: std::process::Stdio,
     pub stderr: std::process::Stdio,
 }
 
 impl Stdio {
-    /// No input; output and errors inherited.
+    /// Output and errors inherited.
     pub fn inherit() -> Self {
         Self {
-            stdin: std::process::Stdio::null(),
             stdout: std::process::Stdio::inherit(),
             stderr: std::process::Stdio::inherit(),
         }
     }
 
-    /// No input; output and errors piped to the caller.
+    /// Output and errors piped to the caller.
     pub fn piped() -> Self {
         Self {
-            stdin: std::process::Stdio::null(),
             stdout: std::process::Stdio::piped(),
             stderr: std::process::Stdio::piped(),
         }
@@ -274,10 +273,6 @@ impl Sandbox {
     /// The helper's PID.
     pub fn id(&self) -> u32 {
         self.child.id()
-    }
-
-    pub fn stdin(&mut self) -> Option<ChildStdin> {
-        self.child.stdin.take()
     }
 
     pub fn stdout(&mut self) -> Option<ChildStdout> {
@@ -524,15 +519,33 @@ fn net_plan(spec: &Spec) -> Result<Option<NetPlan>> {
     }))
 }
 
+/// The caller's subordinate ranges for `count` ids and the tools that map them.
+fn resolve_subids(count: u32) -> Result<SubidPlan> {
+    use std::os::unix::fs::MetadataExt;
+    let read = |file: &str| std::fs::read_to_string(file).map_err(|e| Error::Prerequisite(format!("{file}: {e}")));
+    // `/proc/self` belongs to the caller's effective ids.
+    let me = std::fs::metadata("/proc/self")?;
+    let uid = me.uid();
+    let name = subid::user_name(&read("/etc/passwd")?, uid).unwrap_or_else(|| uid.to_string());
+    let range = |file: &str| {
+        subid::find(&read(file)?, &name, uid, count).map_err(|e| Error::Prerequisite(format!("{file}: {e}")))
+    };
+    let (uids, gids) = (range("/etc/subuid")?, range("/etc/subgid")?);
+    Ok(SubidPlan {
+        newuidmap: binary::find_system("newuidmap")?,
+        newgidmap: binary::find_system("newgidmap")?,
+        uid_start: uids.start,
+        gid_start: gids.start,
+        count,
+    })
+}
+
 /// Checks `spec` and resolves everything the helper needs.
 #[doc(hidden)]
 pub fn plan(spec: &Spec) -> Result<Plan> {
     spec.check().map_err(Error::InvalidSpec)?;
     if spec.root != Root::Empty {
         return Err(Error::Unsupported("roots other than Root::Empty"));
-    }
-    if matches!(spec.ids, Ids::Subordinate { .. }) {
-        return Err(Error::Unsupported("subordinate ids"));
     }
     if spec.seccomp {
         return Err(Error::Unsupported("seccomp for sandboxed programs"));
@@ -541,7 +554,10 @@ pub fn plan(spec: &Spec) -> Result<Plan> {
         spec: spec.clone(),
         root: spec.run_dir.join("sandbox-root"),
         pid_file: pid_file(&spec.run_dir),
-        subid: None,
+        subid: match spec.ids {
+            Ids::Subordinate { count } => Some(resolve_subids(count)?),
+            Ids::Caller => None,
+        },
         net: net_plan(spec)?,
     })
 }
@@ -586,7 +602,7 @@ pub fn spawn(spec: &Spec, stdio: Stdio) -> Result<Sandbox> {
     let (program, args) = launcher(&helper, &path, spec.limits.cgroup.as_ref());
     let child = std::process::Command::new(program)
         .args(args)
-        .stdin(stdio.stdin)
+        .stdin(std::process::Stdio::null())
         .stdout(stdio.stdout)
         .stderr(stdio.stderr)
         .process_group(0)

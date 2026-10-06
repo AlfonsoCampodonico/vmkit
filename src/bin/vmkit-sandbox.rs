@@ -1,12 +1,14 @@
 //! `vmkit-sandbox`: runs one VMM inside unprivileged user, PID, mount, net, IPC and UTS
 //! namespaces with a minimal root (kiln spec §9.2). Started by the vmkit library.
 //!
-//!   vmkit-sandbox run <plan.json>    outer: user + PID namespaces, attaches pasta, waits for the VMM
-//!   vmkit-sandbox init <plan.json>   inner (PID 1): mount, net, IPC and UTS namespaces, then execs the VMM
+//!   vmkit-sandbox run <plan.json>      outer: user + PID namespaces, attaches pasta, waits for the program
+//!   vmkit-sandbox userns <plan.json>   for subordinate ids: the user namespace `run` maps from outside
+//!   vmkit-sandbox init <plan.json>     inner (PID 1): mount, net, IPC and UTS namespaces, then the program
 //!
-//! The outer helper and `init` talk over a socket on `init`'s stdin: `init` sends
-//! `ready` once its namespaces exist, and waits for `go`, which the outer helper sends
-//! after attaching `pasta`. If the outer helper dies first, `init` sees end-of-file.
+//! Stages talk over a socket on the later stage's stdin. `userns` sends `unshared` once its
+//! user namespace exists and waits for `mapped`, which `run` sends after `newuidmap` and
+//! `newgidmap`. `init` sends `ready` once its namespaces exist, and waits for `go`, which its
+//! parent sends after attaching `pasta`. If a parent dies first, the stage sees end-of-file.
 #![deny(unsafe_code)]
 
 #[cfg(not(target_os = "linux"))]
@@ -44,7 +46,7 @@ mod linux {
         set_capabilities, set_no_new_privs,
     };
     use vmkit::net::{GATEWAY, PREFIX, TAP};
-    use vmkit::sandbox::{Mount, NetKind, NetPlan, Plan, Policy, Program};
+    use vmkit::sandbox::{Mount, NetKind, NetPlan, Plan, Policy, Program, SubidPlan};
 
     /// The capabilities `init` needs inside the user namespace: mounts and pivot_root,
     /// then the net namespace's tap and nftables. They reach `init` (and `pasta`) across
@@ -65,8 +67,9 @@ mod linux {
         let args: Vec<String> = std::env::args().collect();
         match (args.get(1).map(String::as_str), args.get(2)) {
             (Some("run"), Some(plan)) => run(plan),
+            (Some("userns"), Some(plan)) => userns(plan),
             (Some("init"), Some(plan)) => init(plan),
-            _ => fail("usage", "vmkit-sandbox run|init <plan.json>"),
+            _ => fail("usage", "vmkit-sandbox run|userns|init <plan.json>"),
         }
     }
 
@@ -172,6 +175,9 @@ mod linux {
                 "the VMM would keep every capability in its namespaces; run vmkit as an unprivileged user (kiln spec T6)",
             );
         }
+        if let Some(subid) = &plan.subid {
+            run_subordinate(subid, plan_path);
+        }
         unshare(UnshareFlags::NEWUSER | UnshareFlags::NEWPID);
         // Identity-map the invoking user (no root inside the namespace).
         let write = |file: &str, data: String| {
@@ -191,12 +197,23 @@ mod linux {
         write("/proc/self/setgroups", "deny".into());
         write("/proc/self/uid_map", format!("{uid} {uid} 1"));
         write("/proc/self/gid_map", format!("{gid} {gid} 1"));
+        continue_in_userns(&plan, plan_path);
+    }
+
+    /// The rest of the outer helper, inside the sandbox's user namespace: limits, then `init`
+    /// as PID 1 of the new PID namespace, `pasta`, and the program's exit.
+    fn continue_in_userns(plan: &Plan, plan_path: &str) -> ! {
         // Nothing in the sandbox (the VMM above all) may create user namespaces of its own:
-        // this AppArmor profile's permission would otherwise reach the VMM too.
-        fs::write("/proc/sys/user/max_user_namespaces", "0")
+        // this AppArmor profile's permission would otherwise reach the program too. A nested
+        // program's namespace is the one exception; `init` creates it and closes the door behind it.
+        let nested = if plan.spec.nest { "1" } else { "0" };
+        fs::write("/proc/sys/user/max_user_namespaces", nested)
             .unwrap_or_else(|e| fail("writing /proc/sys/user/max_user_namespaces", e));
         // No core dump holds guest memory.
         limit(Resource::Core, "core dumps", 0);
+        // Nothing in the sandbox may trace this stage.
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+            .unwrap_or_else(|e| fail("making the helper undumpable", e));
         pass_setup_capabilities();
         let (ours, theirs) = UnixStream::pair().unwrap_or_else(|e| fail("socketpair", e));
         let me = std::env::current_exe().unwrap_or_else(|e| fail("finding myself", e));
@@ -222,7 +239,74 @@ mod linux {
         }
         drop(lines);
         drop(ours);
-        mirror(child.wait().unwrap_or_else(|e| fail("waiting for the VMM", e)));
+        mirror(child.wait().unwrap_or_else(|e| fail("waiting for the sandbox", e)));
+    }
+
+    /// For subordinate ids: starts `userns`, maps its user namespace with `newuidmap` and
+    /// `newgidmap` once it exists, and ends as it ends.
+    fn run_subordinate(subid: &SubidPlan, plan_path: &str) -> ! {
+        let (ours, theirs) = UnixStream::pair().unwrap_or_else(|e| fail("socketpair", e));
+        let me = std::env::current_exe().unwrap_or_else(|e| fail("finding myself", e));
+        let mut child = Command::new(me)
+            .args(["userns", plan_path])
+            .stdin(std::os::fd::OwnedFd::from(theirs))
+            .spawn()
+            .unwrap_or_else(|e| fail("starting the user namespace", e));
+        let mut lines = BufReader::new(&ours);
+        let mut line = String::new();
+        if lines.read_line(&mut line).is_err() || line != "unshared\n" {
+            // The stage failed and said why.
+            mirror(child.wait().unwrap_or_else(|e| fail("waiting for the sandbox", e)));
+        }
+        map_subordinate(subid, child.id());
+        (&ours)
+            .write_all(b"mapped\n")
+            .unwrap_or_else(|e| fail("signalling the id maps", e));
+        drop(lines);
+        drop(ours);
+        mirror(child.wait().unwrap_or_else(|e| fail("waiting for the sandbox", e)));
+    }
+
+    /// Maps root to the caller and `1..=count` to the subordinate ranges in `pid`'s user namespace.
+    fn map_subordinate(s: &SubidPlan, pid: u32) {
+        let uid = rustix::process::getuid().as_raw();
+        let gid = rustix::process::getgid().as_raw();
+        for (tool, own, start) in [(&s.newuidmap, uid, s.uid_start), (&s.newgidmap, gid, s.gid_start)] {
+            let args = [pid, 0, own, 1, 1, start, s.count].map(|n| n.to_string());
+            let status = Command::new(tool)
+                .args(args)
+                .stdin(Stdio::null())
+                .status()
+                .unwrap_or_else(|e| fail(&format!("starting {}", tool.display()), e));
+            if !status.success() {
+                fail(&tool.display().to_string(), format!("exited with {status}"));
+            }
+        }
+    }
+
+    /// The user namespace for subordinate ids: `run` maps it from outside.
+    fn userns(plan_path: &str) {
+        set_parent_process_death_signal(Some(Signal::KILL)).unwrap_or_else(|e| fail("pdeathsig", e));
+        let plan = read_plan(plan_path);
+        unshare(UnshareFlags::NEWUSER);
+        let control = std::io::stdin()
+            .as_fd()
+            .try_clone_to_owned()
+            .unwrap_or_else(|e| fail("dup stdin", e));
+        let control = UnixStream::from(control);
+        (&control)
+            .write_all(b"unshared\n")
+            .unwrap_or_else(|e| fail("signalling the user namespace", e));
+        let mut line = String::new();
+        BufReader::new(&control)
+            .read_line(&mut line)
+            .unwrap_or_else(|e| fail("waiting for the id maps", e));
+        if line != "mapped\n" {
+            fail("waiting for the id maps", "the outer helper went away");
+        }
+        drop(control);
+        unshare(UnshareFlags::NEWPID);
+        continue_in_userns(&plan, plan_path);
     }
 
     /// Starts `pasta` on the VM's namespace. It returns once its interface is configured
@@ -395,6 +479,10 @@ mod linux {
             fail("waiting for go", "the outer helper went away");
         }
         drop(control);
+        // The program's stdin, from the host: the new root need not have a /dev/null.
+        let null = fs::File::open("/dev/null").unwrap_or_else(|e| fail("opening /dev/null", e));
+        rustix::stdio::dup2_stdin(&null).unwrap_or_else(|e| fail("stdin", e));
+        drop(null);
         mount_change("/", MountPropagationFlags::PRIVATE | MountPropagationFlags::REC)
             .unwrap_or_else(|e| fail("making mounts private", e));
         let root = &plan.root;
@@ -449,7 +537,7 @@ mod linux {
                 .unwrap_or_else(|| "vmm".into())
         });
         let mut exec = Command::new(target);
-        exec.arg0(name).args(&command.args).stdin(Stdio::null());
+        exec.arg0(name).args(&command.args).stdin(Stdio::inherit());
         if let Some(env) = &command.env {
             exec.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
         }
