@@ -5,6 +5,11 @@
 //! ranges, `ip`, `nft`, `pasta`) into a [`Plan`], and runs `vmkit-sandbox run <plan.json>`;
 //! the helper does the namespace work.
 //!
+//! Needs Linux 5.12 or later, a helper that may create user namespaces (see
+//! `scripts/install-apparmor.sh`), and for [`Ids::Subordinate`] `newuidmap`, `newgidmap` and a
+//! range of at least `count` ids in `/etc/subuid` and `/etc/subgid`; networks need `ip`, `nft`
+//! and `pasta`. The README's "Sandboxing any program" describes each option.
+//!
 //! A VMM runs in an empty root: a read-only tmpfs with only its devices, `/vmm` (itself),
 //! `/vm/kernel`, `/vm/initramfs`, `/vm/disk/<n>` and `/vm/sock/`, which is `<run_dir>/sock`
 //! on the host. Its paths never depend on where files live on the host.

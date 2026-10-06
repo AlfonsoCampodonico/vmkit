@@ -1,4 +1,5 @@
-//! VMM-neutral microVM lifecycle for Firecracker and Cloud Hypervisor (kiln spec §4.1).
+//! VMM-neutral microVM lifecycle for Firecracker and Cloud Hypervisor (kiln spec §4.1), and the
+//! rootless sandbox the VMMs run in, which also runs any other program ([`sandbox`]).
 #![forbid(unsafe_code)]
 
 mod binary;
@@ -9,7 +10,6 @@ mod firecracker;
 mod http;
 pub mod net;
 mod process;
-#[doc(hidden)]
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]

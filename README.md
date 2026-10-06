@@ -30,6 +30,41 @@ let end = vm.wait()?;
 - **Network:** `VmSpec::net` gives the guest `eth0` at `172.30.0.2/30` (gateway and DNS `172.30.0.1`, `vmkit::net`) in the VM's own namespace: a tap, an nftables policy (`Egress::Restricted` by default: no link-local or cloud metadata, private, CGNAT, loopback, multicast or host addresses, where the host addresses are those present when the VM is created; `allow` exceptions, ignored under `Open`; `DenyAll` but DNS; `Open`), spoofed and IPv6 traffic dropped, and `pasta` for egress through host sockets and port forwards. The VMM itself opens no connections through `pasta`. Host ports below 1024 cannot be forwarded by an unprivileged `pasta` (unless the host lowers `net.ipv4.ip_unprivileged_port_start`): creating the VM fails with `pasta`'s message.
 - **Snapshots:** `Vm::snapshot` and `Vmm::restore` have their final shape but return `Error::Unsupported` until the snapshot work lands.
 
+## Sandboxing any program
+
+`vmkit::sandbox::spawn` runs any program in the same helper, for example a build step (potter's namespace executor):
+
+```rust
+use vmkit::sandbox::{self, Command, Ids, Limits, Network, Program, Root, Spec, Stdio};
+
+let spec = Spec {
+    command: Command {
+        program: Program::Path("/bin/sh".into()),
+        arg0: None,
+        args: vec!["-c".into(), "npm ci".into()],
+        env: Some(vec![("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into())]),
+        cwd: "/app".into(),
+        user: None, // root inside: the caller on the host
+    },
+    root: Root::Overlay { lowers: vec![base.into()], upper: upper.into(), work: work.into() },
+    mounts: vec![],
+    ids: Ids::Subordinate { count: 65536 },
+    network: Network::Egress(vmkit::NetSpec::default()),
+    nest: true,
+    seccomp: true,
+    limits: Limits { open_files: 1 << 16, processes: 4096, cgroup: None },
+    run_dir: run_dir.into(),
+};
+let status = sandbox::spawn(&spec, Stdio::inherit())?.wait()?;
+```
+
+- **Ids:** `Ids::Subordinate { count }` maps root to the caller and ids `1..=count` to the caller's `/etc/subuid` and `/etc/subgid` ranges through `newuidmap` and `newgidmap`, so files the program creates as uid 1000 belong to `subuid + 999` on the host. `Ids::Caller` is the VMM sandbox's single unprivileged id.
+- **Roots:** `Root::Empty` (the VMM sandbox's tmpfs), `Root::Host` (the host tree, recursively read-only and nosuid, with the sandbox's own `/proc`; mount targets must exist), or `Root::Overlay` (an overlay mounted with `userxattr`, so whiteouts are 0/0 character devices and opaque directories carry `user.overlay.opaque`; it gets `/proc`, a read-only `/sys`, and a `/dev` with null, zero, full, random, urandom, tty, pts and shm). `Mount::Bind` and `Mount::Tmpfs` go on top; their writes never reach the upper.
+- **Nesting:** with `nest`, the program runs in a user namespace of its own, mapped from outside with every id of the sandbox. It is still root over its files but holds no capability over the sandbox's mount and network namespaces: it cannot mount, change routes or the nftables policy, or create namespaces. `init` stays PID 1 and undumpable, so the program can neither signal nor inspect it.
+- **Network:** `Network::None` (loopback only), `Network::Tap` (the VM network above), or `Network::Egress`: no tap, the namespace's own processes reach out through `pasta` under the same deny and allow sets, IPv6 and inbound connections are dropped, and DNS is answered at `vmkit::net::NAMESERVER` (put it in the root's `resolv.conf`).
+- **Seccomp:** `seccomp` refuses mounts, namespace changes (including `clone` with namespace flags; `clone3` is `ENOSYS` so libc falls back to `clone`), keyrings, BPF, perf, userfaultfd, io_uring, modules, kexec, swap, reboot, clock changes and handle-based opens.
+- **Process:** the program's stdin is `/dev/null`; `Stdio` sets its stdout and stderr. `init` supervises it as PID 1 and reaps everything; when the program ends, so does everything it started. The sandbox's exit mirrors the program's code or signal; a setup failure exits 125 with one `vmkit-sandbox: ...` line on stderr. `Sandbox::kill` ends everything in it.
+
 ## Requirements
 
 Linux with KVM (`/dev/kvm`, user in the `kvm` group), the pinned VMMs, and the sandbox helper:
@@ -40,6 +75,8 @@ cargo build --release --bin vmkit-sandbox
 sudo install -m 0755 target/release/vmkit-sandbox /usr/local/bin/
 scripts/install-apparmor.sh /usr/local/bin/vmkit-sandbox   # uses sudo; only acts where AppArmor restricts user namespaces
 ```
+
+Sandboxing other programs with `Ids::Subordinate` also needs `newuidmap` and `newgidmap` (`uidmap` on Debian and Ubuntu) and a range of at least `count` ids for the user in `/etc/subuid` and `/etc/subgid`; overlay roots need Linux 5.12 or later (6.8 or later for many layers).
 
 Ubuntu 23.10 and later restrict unprivileged user namespaces through AppArmor; the profile lets the helper create its own. The profile grants that to any binary at the given path, so install the helper to a root-owned path such as `/usr/local/bin`, not to a directory you can write. Networking also needs `pasta` (passt 2024-02-20 or later, as in Ubuntu 24.04 and Debian 13), `nft` and `ip`; `$VMKIT_PASTA` overrides the `pasta` found on `PATH`.
 
@@ -88,6 +125,7 @@ testguest/net-fixture.sh                     # fixture addresses for the network
 export VMKIT_SANDBOX=$PWD/target/debug/vmkit-sandbox VMKIT_TEST_NET=1 VMKIT_REQUIRE_KVM_TESTS=1
 export VMKIT_TEST_KERNEL=out/vmlinux-6.18.54-aarch64 VMKIT_TEST_INITRAMFS=out/initramfs.cpio.gz
 cargo test --test sandbox                    # the helper alone, with busybox as the VMM (no KVM)
+cargo test --test exec                       # any program: ids, roots, nesting, egress, seccomp (no KVM; needs uidmap and a subuid range)
 cargo test --test contract -- --test-threads=4
 cargo test --test network -- --test-threads=4
 cargo test --test pause -- --test-threads=1

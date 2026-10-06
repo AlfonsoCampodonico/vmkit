@@ -146,6 +146,8 @@ impl Fixture {
         for d in ["bin", "etc", "proc", "sys", "dev", "tmp"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
+        // As in real images: /tmp is world-writable and sticky.
+        std::fs::set_permissions(root.join("tmp"), std::os::unix::fs::PermissionsExt::from_mode(0o1777)).unwrap();
         std::fs::copy(BUSYBOX, root.join("bin/busybox")).unwrap();
         for applet in [
             "sh", "ls", "cat", "rm", "mkdir", "touch", "chown", "id", "env", "sleep", "mount", "ip", "unshare", "kill",
@@ -569,4 +571,61 @@ fn seccomp_denies_namespaces_and_mounts_but_not_ordinary_work() {
     );
     assert!(out.stdout.contains("mount: permission denied"), "{}", out.stdout);
     assert!(out.stdout.ends_with("ok\ndone\n"), "{}", out.stdout);
+}
+
+#[test]
+fn killing_the_sandbox_ends_everything_in_it() {
+    let Some(t) = Fixture::new() else { return };
+    let w = t.path("w");
+    let mut s = t.host_spec(&[
+        "/bin/sh",
+        "-c",
+        &format!("(sleep 3; touch {}/late) & sleep 30", w.display()),
+    ]);
+    s.mounts.push(t.w_bind());
+    let mut sandbox = sandbox::spawn(&s, sandbox::Stdio::piped()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    sandbox.kill().unwrap();
+    sandbox.wait().unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    assert!(!w.join("late").exists(), "a process outlived the killed sandbox");
+}
+
+#[test]
+fn a_cgroup_holds_the_program_when_scopes_are_available() {
+    let Some(t) = Fixture::new() else { return };
+    if !sandbox::cgroups_available() {
+        return;
+    }
+    let mut s = t.host_spec(&["/bin/cat", "/proc/self/cgroup"]);
+    s.limits.cgroup = Some(sandbox::Cgroup {
+        memory_mib: 64,
+        cpu_percent: 100,
+        tasks: 64,
+    });
+    let out = t.output(&s);
+    assert!(out.stdout.contains(".scope"), "{} {}", out.stdout, out.stderr);
+}
+
+#[test]
+fn a_build_step_runs_nested_under_seccomp_as_a_user() {
+    // What potter's NsExecutor asks for: overlay root, nested namespace, seccomp, a non-root user.
+    // The second step reuses the first one's upper, as a build chain does.
+    let Some(t) = Fixture::new() else { return };
+    let mut s = t.overlay_spec("mkdir -p /home/app && echo built >/home/app/out && id -u && cat /home/app/out");
+    s.nest = true;
+    s.seccomp = true;
+    let out = t.output(&s);
+    assert_eq!(out.stdout, "0\nbuilt\n", "{}", out.stderr);
+    s.command.args = vec![
+        "-c".into(),
+        "id -u; touch /home/app/x 2>/dev/null || echo denied; touch /tmp/ok && echo tmp".into(),
+    ];
+    s.command.user = Some(User {
+        uid: 1000,
+        gid: 1000,
+        groups: vec![],
+    });
+    let out = t.output(&s);
+    assert_eq!(out.stdout, "1000\ndenied\ntmp\n", "{}", out.stderr);
 }
