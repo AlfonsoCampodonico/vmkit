@@ -107,7 +107,7 @@ impl Vmm for CloudHypervisor {
             "true".into(),
         ];
         crate::process::clear_socket(&api)?;
-        let proc = sandbox::spawn(
+        let proc = sandbox::spawn_vmm(
             &self.sandbox,
             &self.binary,
             &args,

@@ -27,7 +27,7 @@ mod linux {
     use std::os::fd::{AsFd, AsRawFd};
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::{CommandExt, ExitStatusExt};
-    use std::path::{Component, Path};
+    use std::path::Path;
     use std::process::{Command, ExitStatus, Stdio};
 
     use rustix::fs::{CWD, Dir, FileType, Mode, OFlags, fstat, openat, statvfs};
@@ -44,7 +44,7 @@ mod linux {
         set_capabilities, set_no_new_privs,
     };
     use vmkit::net::{GATEWAY, PREFIX, TAP};
-    use vmkit::sandbox::{NetPlan, Plan};
+    use vmkit::sandbox::{Mount, NetKind, NetPlan, Plan, Policy, Program};
 
     /// The capabilities `init` needs inside the user namespace: mounts and pivot_root,
     /// then the net namespace's tap and nftables. They reach `init` (and `pasta`) across
@@ -211,8 +211,12 @@ mod linux {
         let mut lines = BufReader::new(&ours);
         let mut line = String::new();
         if lines.read_line(&mut line).is_ok() && line == "ready\n" {
-            if let Some(net) = &plan.net {
-                attach_pasta(net, pid);
+            if let Some(NetPlan {
+                kind: NetKind::Tap(policy) | NetKind::Egress(policy),
+                ..
+            }) = &plan.net
+            {
+                attach_pasta(policy, pid);
             }
             let _ = (&ours).write_all(b"go\n");
         }
@@ -225,7 +229,7 @@ mod linux {
     /// and keeps running in the PID namespace, so it ends with the VMM. After it daemonizes
     /// its daemon is a child of the VMM (PID 1), which never reaps it if it exits early; it
     /// cannot outlive the PID namespace.
-    fn attach_pasta(net: &NetPlan, pid: u32) {
+    fn attach_pasta(net: &Policy, pid: u32) {
         let status = Command::new(&net.pasta)
             .args(&net.pasta_args)
             .args(["--netns", &format!("/proc/{pid}/ns/net"), "--netns-only"])
@@ -260,18 +264,18 @@ mod linux {
     }
 
     /// The tap the VMM opens (owned by the invoking user), routing, and the nftables policy.
-    fn setup_net(net: &NetPlan) {
+    fn setup_net(ip: &Path, net: &Policy) {
         let uid = rustix::process::getuid().as_raw().to_string();
         let gid = rustix::process::getgid().as_raw().to_string();
         let gateway = format!("{GATEWAY}/{PREFIX}");
-        tool(&net.ip, &["link", "set", "lo", "up"], None);
+        tool(ip, &["link", "set", "lo", "up"], None);
         tool(
-            &net.ip,
+            ip,
             &["tuntap", "add", TAP, "mode", "tap", "user", &uid, "group", &gid],
             None,
         );
-        tool(&net.ip, &["addr", "add", &gateway, "dev", TAP], None);
-        tool(&net.ip, &["link", "set", TAP, "up"], None);
+        tool(ip, &["addr", "add", &gateway, "dev", TAP], None);
+        tool(ip, &["link", "set", TAP, "up"], None);
         // Both apply to this namespace only. `route_localnet` lets a forwarded connection that
         // pasta spliced from host loopback leave through the tap after DNAT.
         let sysctl = |path: &str| fs::write(path, "1").unwrap_or_else(|e| fail(&format!("writing {path}"), e));
@@ -344,25 +348,35 @@ mod linux {
         }
     }
 
+    /// A tmpfs of `size_mib` on `target`, created if missing.
+    fn tmpfs(target: &Path, size_mib: u32) {
+        fs::create_dir_all(target).unwrap_or_else(|e| fail(&format!("mkdir {}", target.display()), e));
+        let options =
+            std::ffi::CString::new(format!("mode=0755,size={size_mib}m")).unwrap_or_else(|e| fail("tmpfs options", e));
+        mount(
+            "tmpfs",
+            target,
+            "tmpfs",
+            MountFlags::NOSUID | MountFlags::NODEV,
+            Some(options.as_c_str()),
+        )
+        .unwrap_or_else(|e| fail(&format!("mounting a tmpfs on {}", target.display()), e));
+    }
+
     fn init(plan_path: &str) {
         // If the outer helper dies, so does everything in this PID namespace.
         set_parent_process_death_signal(Some(Signal::KILL)).unwrap_or_else(|e| fail("pdeathsig", e));
         let plan = read_plan(plan_path);
-        for b in &plan.binds {
-            let plain = b.target.is_absolute()
-                && b.target
-                    .components()
-                    .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
-            if !plain {
-                fail(
-                    &b.target.display().to_string(),
-                    "a bind target must be an absolute path without `.` or `..`",
-                );
-            }
-        }
+        // The library checked the spec; a plan file is checked again before it is trusted.
+        plan.spec.check().unwrap_or_else(|e| fail("the plan", e));
         unshare(UnshareFlags::NEWNS | UnshareFlags::NEWNET | UnshareFlags::NEWIPC | UnshareFlags::NEWUTS);
-        if let Some(net) = &plan.net {
-            setup_net(net);
+        match &plan.net {
+            Some(NetPlan {
+                ip,
+                kind: NetKind::Tap(policy),
+            }) => setup_net(ip, policy),
+            Some(_) => fail("the network", "not implemented yet"),
+            None => {}
         }
         // `go` also proves the outer helper outlived the death-signal setup above.
         let control = std::io::stdin()
@@ -394,9 +408,19 @@ mod linux {
         )
         .unwrap_or_else(|e| fail("mounting the root tmpfs", e));
         let inside = |p: &Path| root.join(p.strip_prefix("/").unwrap_or(p));
-        attach(&plan.vmm, &inside(Path::new("/vmm")), false);
-        for b in &plan.binds {
-            attach(&b.source, &inside(&b.target), b.writable);
+        let Program::Bound { host, target } = &plan.spec.command.program else {
+            fail("the program", "Root::Empty runs a bound program")
+        };
+        attach(host, &inside(target), false);
+        for m in &plan.spec.mounts {
+            match m {
+                Mount::Bind {
+                    source,
+                    target,
+                    writable,
+                } => attach(source, &inside(target), *writable),
+                Mount::Tmpfs { target, size_mib } => tmpfs(&inside(target), *size_mib),
+            }
         }
         let old = root.join("old-root");
         fs::create_dir_all(&old).unwrap_or_else(|e| fail("mkdir old-root", e));
@@ -406,8 +430,8 @@ mod linux {
         fs::remove_dir("/old-root").unwrap_or_else(|e| fail("removing old-root", e));
         mount_remount("/", MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV, "")
             .unwrap_or_else(|e| fail("making the root read-only", e));
-        limit(Resource::Nofile, "open files", plan.limits.open_files);
-        limit(Resource::Nproc, "processes", plan.limits.processes);
+        limit(Resource::Nofile, "open files", plan.spec.limits.open_files);
+        limit(Resource::Nproc, "processes", plan.spec.limits.processes);
         limit(Resource::Core, "core dumps", 0);
         leave_session_keyring();
         set_no_new_privs(true).unwrap_or_else(|e| fail("no_new_privs", e));
@@ -416,16 +440,19 @@ mod linux {
         let mut caps = capabilities(None).unwrap_or_else(|e| fail("reading capabilities", e));
         caps.inheritable = CapabilitySet::empty();
         set_capabilities(None, caps).unwrap_or_else(|e| fail("clearing inheritable capabilities", e));
-        let name = plan
-            .vmm
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "vmm".into());
-        let err = Command::new("/vmm")
-            .arg0(name)
-            .args(&plan.args)
-            .stdin(Stdio::null())
-            .exec();
-        fail("exec", err);
+        let command = &plan.spec.command;
+        std::env::set_current_dir(&command.cwd)
+            .unwrap_or_else(|e| fail(&format!("chdir {}", command.cwd.display()), e));
+        let name = command.arg0.clone().unwrap_or_else(|| {
+            host.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "vmm".into())
+        });
+        let mut exec = Command::new(target);
+        exec.arg0(name).args(&command.args).stdin(Stdio::null());
+        if let Some(env) = &command.env {
+            exec.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+        }
+        fail("exec", exec.exec());
     }
 }

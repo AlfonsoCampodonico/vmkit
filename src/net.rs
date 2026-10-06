@@ -5,6 +5,8 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
+
 /// The tap device in the VM's namespace.
 pub const TAP: &str = "tap0";
 /// The namespace's address on the tap: the guest's gateway and DNS server.
@@ -35,7 +37,8 @@ const RESTRICTED: [&str; 10] = [
 ];
 
 /// An IPv4 network such as `10.0.0.0/8`; a bare address is a `/32`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Cidr {
     addr: Ipv4Addr,
     prefix: u8,
@@ -78,6 +81,20 @@ impl FromStr for Cidr {
     }
 }
 
+impl TryFrom<String> for Cidr {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, String> {
+        s.parse()
+    }
+}
+
+impl From<Cidr> for String {
+    fn from(c: Cidr) -> String {
+        c.to_string()
+    }
+}
+
 impl fmt::Display for Cidr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.addr, self.prefix)
@@ -85,7 +102,7 @@ impl fmt::Display for Cidr {
 }
 
 /// What the guest may reach (`--egress`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Egress {
     /// Everything except link-local (cloud metadata), CGNAT, RFC 1918, `0/8`,
     /// loopback, multicast and reserved ranges, and the host's own addresses.
@@ -97,7 +114,7 @@ pub enum Egress {
     Open,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Protocol {
     Tcp,
     Udp,
@@ -113,7 +130,7 @@ impl Protocol {
 }
 
 /// Host port `host` reaches guest port `guest` (`-p HOST:GUEST/proto`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortForward {
     pub protocol: Protocol,
     pub host: u16,
@@ -121,7 +138,7 @@ pub struct PortForward {
 }
 
 /// A network interface for the guest, `eth0` at [`GUEST`]/[`PREFIX`] via [`GATEWAY`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NetSpec {
     pub egress: Egress,
     /// Exceptions to `Restricted` and `DenyAll`; ignored under `Egress::Open`.

@@ -80,7 +80,7 @@ impl Vmm for Firecracker {
         std::fs::create_dir_all(spec.run_dir.join("sock"))?;
         process::clear_socket(&api)?;
         process::create_vmm_file(&log)?;
-        let proc = sandbox::spawn(
+        let proc = sandbox::spawn_vmm(
             &self.sandbox,
             &self.binary,
             &args,
