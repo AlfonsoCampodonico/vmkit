@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -121,6 +121,10 @@ pub(crate) struct Proc {
 
 /// Starts `binary args...` with the guest serial (the VMM's stdout) appended to
 /// `console_log` and the VMM's stderr in `log`.
+///
+/// The child gets a process group of its own, so the terminal's signals (Ctrl-C, Ctrl-\,
+/// a hangup) reach only the caller's group: the caller decides how the VM ends, for
+/// example with a graceful shutdown, instead of the VMM dying with its terminal.
 pub(crate) fn spawn(binary: &Path, args: &[String], console_log: &Path, log: &Path) -> Result<Proc> {
     let console = OpenOptions::new().create(true).append(true).open(console_log)?;
     let log_file = File::create(log)?;
@@ -129,6 +133,7 @@ pub(crate) fn spawn(binary: &Path, args: &[String], console_log: &Path, log: &Pa
         .stdin(Stdio::null())
         .stdout(console)
         .stderr(log_file)
+        .process_group(0)
         .spawn()?;
     Ok(Proc {
         child: Arc::new(Mutex::new(child)),
@@ -340,6 +345,17 @@ mod tests {
         let end = p.wait(None).unwrap().unwrap();
         assert_eq!((end.reason, end.signal), (EndReason::BackstopFailed, Some(9)));
         p.fail_backstop().unwrap();
+    }
+
+    #[test]
+    fn the_vmm_has_a_process_group_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = sh("echo $$ $(ps -o pgid= -p $$)", dir.path());
+        p.wait(Some(Duration::from_secs(5))).unwrap().unwrap();
+        let out = std::fs::read_to_string(dir.path().join("console")).unwrap();
+        let ids: Vec<&str> = out.split_whitespace().collect();
+        assert_eq!(ids.len(), 2, "{out}");
+        assert_eq!(ids[0], ids[1], "the child leads its own group: {out}");
     }
 
     #[test]
