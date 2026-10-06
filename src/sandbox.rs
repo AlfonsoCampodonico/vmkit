@@ -509,9 +509,11 @@ fn policy(ruleset: impl Fn(&[Ipv4Addr]) -> String, pasta_args: Vec<String>) -> R
 /// The network plan for `spec`.
 fn net_plan(spec: &Spec) -> Result<Option<NetPlan>> {
     let kind = match &spec.network {
-        Network::None => return Ok(None),
+        // The VMM sandbox keeps loopback down (and needs no `ip`).
+        Network::None if spec.root == Root::Empty => return Ok(None),
+        Network::None => NetKind::Loopback,
         Network::Tap(n) => NetKind::Tap(policy(|host| net::ruleset(n, host), net::pasta_args(n))?),
-        Network::Egress(_) => return Err(Error::Unsupported("egress without a tap")),
+        Network::Egress(n) => NetKind::Egress(policy(|host| net::egress_ruleset(n, host), net::pasta_args(n))?),
     };
     Ok(Some(NetPlan {
         ip: binary::find_system("ip")?,

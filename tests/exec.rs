@@ -149,6 +149,7 @@ impl Fixture {
         std::fs::copy(BUSYBOX, root.join("bin/busybox")).unwrap();
         for applet in [
             "sh", "ls", "cat", "rm", "mkdir", "touch", "chown", "id", "env", "sleep", "mount", "ip", "unshare", "kill",
+            "nc",
         ] {
             std::os::unix::fs::symlink("busybox", root.join("bin").join(applet)).unwrap();
         }
@@ -260,7 +261,8 @@ fn proc_is_the_sandboxs_own_and_the_program_is_not_pid_1() {
     let out = t.run_host(&["/bin/sh", "-c", "echo $$; ls /proc | grep -c '^[0-9]'"], vec![]);
     assert!(out.status.success(), "{}", out.stderr);
     let lines: Vec<&str> = out.stdout.lines().collect();
-    assert_eq!(lines[0], "2");
+    // Setup tools (`ip`) may run in the namespace first; the program is never PID 1.
+    assert!(lines[0].parse::<u32>().unwrap() > 1, "{}", out.stdout);
     assert!(lines[1].trim().parse::<u32>().unwrap() <= 4, "{}", out.stdout);
 }
 
@@ -461,4 +463,90 @@ fn a_nested_program_cannot_signal_or_inspect_init() {
     let script = "kill -KILL 1; sleep 0.2; echo alive; cat /proc/1/environ >/dev/null 2>&1 || echo protected";
     let out = t.run_overlay_nested(script);
     assert_eq!(out.stdout, "alive\nprotected\n", "{}", out.stderr);
+}
+
+/// The network suite's fixture addresses on the host's loopback (`testguest/net-fixture.sh`).
+const METADATA: &str = "169.254.169.254";
+const PRIVATE: &str = "10.250.0.1";
+const HOST: &str = "198.51.100.7";
+
+impl Fixture {
+    /// Like `new`, but only with the network fixture (VMKIT_TEST_NET=1).
+    fn net() -> Option<Self> {
+        if std::env::var_os("VMKIT_TEST_NET").is_none_or(|v| v != "1") {
+            assert!(
+                std::env::var_os("VMKIT_REQUIRE_KVM_TESTS").is_none_or(|v| v != "1"),
+                "VMKIT_REQUIRE_KVM_TESTS is set but VMKIT_TEST_NET is not (run testguest/net-fixture.sh)"
+            );
+            return None;
+        }
+        Self::new()
+    }
+
+    /// `script` nested in the overlay root, with egress allowed to the fixture's host address only.
+    fn run_overlay_egress(&self, script: &str) -> Out {
+        let mut s = self.overlay_spec(script);
+        s.nest = true;
+        s.network = Network::Egress(vmkit::NetSpec {
+            allow: vec![HOST.parse().unwrap()],
+            ..Default::default()
+        });
+        self.output(&s)
+    }
+}
+
+/// A host listener on every address, accepting and dropping connections.
+fn listen() -> u16 {
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for c in listener.incoming() {
+            drop(c);
+        }
+    });
+    port
+}
+
+#[test]
+fn egress_reaches_allowed_addresses_but_not_private_or_metadata_ones() {
+    let Some(t) = Fixture::net() else { return };
+    let port = listen();
+    let script = format!(
+        "nc -w 2 {HOST} {port} </dev/null && echo allowed; \
+         nc -w 2 {METADATA} {port} </dev/null || echo metadata-blocked; \
+         nc -w 2 {PRIVATE} {port} </dev/null || echo private-blocked"
+    );
+    let out = t.run_overlay_egress(&script);
+    assert_eq!(
+        out.stdout, "allowed\nmetadata-blocked\nprivate-blocked\n",
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn without_an_allowance_host_addresses_are_denied() {
+    let Some(t) = Fixture::net() else { return };
+    let port = listen();
+    let mut s = t.overlay_spec(&format!("nc -w 2 {HOST} {port} </dev/null || echo denied"));
+    s.nest = true;
+    s.network = Network::Egress(vmkit::NetSpec::default());
+    let out = t.output(&s);
+    assert_eq!(out.stdout, "denied\n", "{}", out.stderr);
+}
+
+#[test]
+fn a_nested_program_cannot_change_the_network() {
+    let Some(t) = Fixture::net() else { return };
+    let out = t.run_overlay_egress(
+        "ip route del default 2>/dev/null || echo kept; ip link set lo down 2>/dev/null || echo up",
+    );
+    assert_eq!(out.stdout, "kept\nup\n", "{}", out.stderr);
+}
+
+#[test]
+fn loopback_is_up_without_a_network() {
+    let Some(t) = Fixture::new() else { return };
+    let out = t.run_overlay("cat /sys/class/net/lo/operstate", Vec::new());
+    assert_eq!(out.stdout.trim(), "unknown", "{}", out.stderr);
 }

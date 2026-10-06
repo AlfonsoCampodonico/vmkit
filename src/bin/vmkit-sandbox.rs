@@ -485,7 +485,17 @@ mod linux {
                 ip,
                 kind: NetKind::Tap(policy),
             }) => setup_net(ip, policy),
-            Some(_) => fail("the network", "not implemented yet"),
+            Some(NetPlan {
+                ip,
+                kind: NetKind::Egress(policy),
+            }) => {
+                tool(ip, &["link", "set", "lo", "up"], None);
+                tool(&policy.nft, &["-f", "-"], Some(&policy.ruleset));
+            }
+            Some(NetPlan {
+                ip,
+                kind: NetKind::Loopback,
+            }) => tool(ip, &["link", "set", "lo", "up"], None),
             None => {}
         }
         // `go` also proves the outer helper outlived the death-signal setup above.
