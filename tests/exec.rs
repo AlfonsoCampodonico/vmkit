@@ -12,7 +12,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
-use vmkit::sandbox::{self, Command, Ids, Limits, Mount, Network, Program, Root, Spec};
+use vmkit::sandbox::{self, Command, Ids, Limits, Mount, Network, Program, Root, Spec, User};
 
 const BUSYBOX: &str = "/usr/bin/busybox";
 const IDS: Ids = Ids::Subordinate { count: 65536 };
@@ -109,6 +109,36 @@ impl Fixture {
         s
     }
 
+    /// `args` (a host program first) in the host root.
+    fn host_spec(&self, args: &[&str]) -> Spec {
+        self.base(
+            Command {
+                program: Program::Path(args[0].into()),
+                arg0: None,
+                args: args[1..].iter().map(|a| a.to_string()).collect(),
+                env: Some(vec![("PATH".into(), "/usr/bin:/bin".into())]),
+                cwd: "/".into(),
+                user: None,
+            },
+            Root::Host,
+        )
+    }
+
+    fn run_host(&self, args: &[&str], mounts: Vec<Mount>) -> Out {
+        let mut s = self.host_spec(args);
+        s.mounts = mounts;
+        self.output(&s)
+    }
+
+    /// The fixture's `w`, writable at its own path.
+    fn w_bind(&self) -> Mount {
+        Mount::Bind {
+            source: self.path("w"),
+            target: self.path("w"),
+            writable: true,
+        }
+    }
+
     fn output(&self, spec: &Spec) -> Out {
         let o = sandbox::spawn(spec, sandbox::Stdio::piped())
             .unwrap()
@@ -156,4 +186,97 @@ fn the_callers_ids_stay_unprivileged() {
     let out = t.output(&t.empty_spec("busybox id -u", Ids::Caller));
     let caller = std::fs::metadata("/proc/self").unwrap().uid().to_string();
     assert_eq!(out.stdout.trim(), caller, "{}", out.stderr);
+}
+
+#[test]
+fn the_host_root_is_read_only_except_writable_binds() {
+    let Some(t) = Fixture::new() else { return };
+    let w = t.path("w");
+    let script = format!(
+        "cat /etc/hostname >/dev/null && ! touch /etc/vmkit-probe 2>/dev/null && ! touch /tmp/vmkit-probe 2>/dev/null && touch {}/ok",
+        w.display()
+    );
+    let out = t.run_host(&["/bin/sh", "-c", &script], vec![t.w_bind()]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(w.join("ok").exists());
+}
+
+#[test]
+fn proc_is_the_sandboxs_own_and_the_program_is_not_pid_1() {
+    let Some(t) = Fixture::new() else { return };
+    let out = t.run_host(&["/bin/sh", "-c", "echo $$; ls /proc | grep -c '^[0-9]'"], vec![]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(lines[0], "2");
+    assert!(lines[1].trim().parse::<u32>().unwrap() <= 4, "{}", out.stdout);
+}
+
+#[test]
+fn the_uid_map_holds_the_caller_and_the_range() {
+    let Some(t) = Fixture::new() else { return };
+    let out = t.run_host(&["/bin/cat", "/proc/self/uid_map"], vec![]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let lines: Vec<Vec<&str>> = out.stdout.lines().map(|l| l.split_whitespace().collect()).collect();
+    let caller = std::fs::metadata("/proc/self").unwrap().uid().to_string();
+    let start = t.subuid_start().to_string();
+    assert_eq!(
+        lines,
+        [vec!["0", caller.as_str(), "1"], vec!["1", start.as_str(), "65536"]]
+    );
+}
+
+#[test]
+fn env_cwd_and_user_are_exactly_the_commands() {
+    let Some(t) = Fixture::new() else { return };
+    let mut s = t.host_spec(&["/bin/sh", "-c", "pwd; id -u; id -g; id -G; env"]);
+    s.command.env = Some(vec![("A".into(), "1".into()), ("PATH".into(), "/usr/bin:/bin".into())]);
+    s.command.cwd = "/usr".into();
+    s.command.user = Some(User {
+        uid: 1000,
+        gid: 1001,
+        groups: vec![1001, 1002],
+    });
+    let out = t.output(&s);
+    assert!(out.status.success(), "{}", out.stderr);
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(lines[..4], ["/usr", "1000", "1001", "1001 1002"]);
+    let env = &lines[4..];
+    assert!(env.contains(&"A=1") && env.contains(&"PATH=/usr/bin:/bin"), "{env:?}");
+    for leaked in ["HOME=", "USER=", "VMKIT_SANDBOX="] {
+        assert!(!env.iter().any(|l| l.starts_with(leaked)), "{leaked} leaked: {env:?}");
+    }
+}
+
+#[test]
+fn exit_codes_and_signals_of_the_program_are_mirrored() {
+    let Some(t) = Fixture::new() else { return };
+    assert_eq!(t.run_host(&["/bin/sh", "-c", "exit 7"], vec![]).status.code(), Some(7));
+    let killed = t.run_host(&["/bin/sh", "-c", "kill -TERM $$"], vec![]);
+    assert_eq!(std::os::unix::process::ExitStatusExt::signal(&killed.status), Some(15));
+}
+
+#[test]
+fn background_processes_die_with_the_program() {
+    let Some(t) = Fixture::new() else { return };
+    let w = t.path("w");
+    let script = format!("(sleep 2; touch {}/late) & exit 0", w.display());
+    let out = t.run_host(&["/bin/sh", "-c", &script], vec![t.w_bind()]);
+    assert!(out.status.success(), "{}", out.stderr);
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(!w.join("late").exists(), "a background process outlived the sandbox");
+}
+
+#[test]
+fn a_bind_target_must_exist_in_the_host_root() {
+    let Some(t) = Fixture::new() else { return };
+    let out = t.run_host(
+        &["/bin/true"],
+        vec![Mount::Bind {
+            source: t.path("w"),
+            target: "/nonexistent-vmkit-target".into(),
+            writable: true,
+        }],
+    );
+    assert_eq!(out.status.code(), Some(125));
+    assert!(out.stderr.contains("must exist"), "{}", out.stderr);
 }

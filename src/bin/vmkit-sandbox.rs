@@ -38,15 +38,16 @@ mod linux {
         MountFlags, MountPropagationFlags, MoveMountFlags, OpenTreeFlags, UnmountFlags, mount, mount_change,
         mount_remount, move_mount, open_tree, unmount,
     };
+    use rustix::process::{Gid, Uid};
     use rustix::process::{
         Resource, Rlimit, Signal, getpid, kill_process, pivot_root, set_parent_process_death_signal, setrlimit,
     };
     use rustix::thread::{
         CapabilitySet, UnshareFlags, capabilities, clear_ambient_capability_set, configure_capability_in_ambient_set,
-        set_capabilities, set_no_new_privs,
+        set_capabilities, set_no_new_privs, set_thread_groups, set_thread_res_gid, set_thread_res_uid,
     };
     use vmkit::net::{GATEWAY, PREFIX, TAP};
-    use vmkit::sandbox::{Mount, NetKind, NetPlan, Plan, Policy, Program, SubidPlan};
+    use vmkit::sandbox::{Mount, NetKind, NetPlan, Plan, Policy, Program, Root, SubidPlan};
 
     /// The capabilities `init` needs inside the user namespace: mounts and pivot_root,
     /// then the net namespace's tap and nftables. They reach `init` (and `pasta`) across
@@ -237,9 +238,24 @@ mod linux {
             }
             let _ = (&ours).write_all(b"go\n");
         }
+        let status = child.wait().unwrap_or_else(|e| fail("waiting for the sandbox", e));
+        // A supervising `init` reports how the program ended: as PID 1 it cannot re-raise a signal.
+        let mut report = String::new();
+        let _ = lines.read_line(&mut report);
         drop(lines);
         drop(ours);
-        mirror(child.wait().unwrap_or_else(|e| fail("waiting for the sandbox", e)));
+        mirror(reported(&report).unwrap_or(status));
+    }
+
+    /// The status in `init`'s report (`exit <code>` or `signal <number>`).
+    fn reported(report: &str) -> Option<ExitStatus> {
+        let (kind, n) = report.trim_end().split_once(' ')?;
+        let n: i32 = n.parse().ok()?;
+        match kind {
+            "exit" => Some(ExitStatus::from_raw((n & 0xff) << 8)),
+            "signal" => Some(ExitStatus::from_raw(n & 0x7f)),
+            _ => None,
+        }
     }
 
     /// For subordinate ids: starts `userns`, maps its user namespace with `newuidmap` and
@@ -368,8 +384,9 @@ mod linux {
         tool(&net.nft, &["-f", "-"], Some(&net.ruleset));
     }
 
-    /// A mount of `source` (opened without following a final symlink) onto `target`.
-    fn attach(source: &Path, target: &Path, writable: bool) {
+    /// A mount of `source` (opened without following a final symlink) onto `target`, which is
+    /// created when missing if `create` (else it must exist).
+    fn attach(source: &Path, target: &Path, writable: bool, create: bool) {
         let fd = open_tree(
             CWD,
             source,
@@ -385,13 +402,21 @@ mod linux {
         if kind == FileType::Symlink {
             fail(&source.display().to_string(), "is a symlink, which vmkit never follows");
         }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).unwrap_or_else(|e| fail("mkdir", e));
-        }
-        if kind == FileType::Directory {
-            fs::create_dir_all(target).unwrap_or_else(|e| fail("mkdir", e));
-        } else {
-            fs::File::create(target).unwrap_or_else(|e| fail(&format!("creating {}", target.display()), e));
+        if fs::symlink_metadata(target).is_err() {
+            if !create {
+                fail(
+                    &target.display().to_string(),
+                    "a mount target must exist under Root::Host",
+                );
+            }
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).unwrap_or_else(|e| fail("mkdir", e));
+            }
+            if kind == FileType::Directory {
+                fs::create_dir_all(target).unwrap_or_else(|e| fail("mkdir", e));
+            } else {
+                fs::File::create(target).unwrap_or_else(|e| fail(&format!("creating {}", target.display()), e));
+            }
         }
         move_mount(&fd, "", CWD, target, MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH)
             .unwrap_or_else(|e| fail(&format!("attaching {}", target.display()), e));
@@ -478,65 +503,199 @@ mod linux {
         if line != "go\n" {
             fail("waiting for go", "the outer helper went away");
         }
-        drop(control);
         // The program's stdin, from the host: the new root need not have a /dev/null.
         let null = fs::File::open("/dev/null").unwrap_or_else(|e| fail("opening /dev/null", e));
         rustix::stdio::dup2_stdin(&null).unwrap_or_else(|e| fail("stdin", e));
         drop(null);
         mount_change("/", MountPropagationFlags::PRIVATE | MountPropagationFlags::REC)
             .unwrap_or_else(|e| fail("making mounts private", e));
+        build_root(&plan);
+        limit(Resource::Nofile, "open files", plan.spec.limits.open_files);
+        limit(Resource::Nproc, "processes", plan.spec.limits.processes);
+        limit(Resource::Core, "core dumps", 0);
+        leave_session_keyring();
+        if plan.spec.root == Root::Empty && !plan.spec.nest {
+            // The VMM sandbox: the program is PID 1 itself.
+            drop(control);
+            exec_program(&plan);
+        }
+        supervise(&plan, control);
+    }
+
+    /// Mounts the root `plan` asks for on `plan.root`, attaches the mounts, and pivots into it.
+    fn build_root(plan: &Plan) {
         let root = &plan.root;
         fs::create_dir_all(root).unwrap_or_else(|e| fail("creating the root", e));
-        mount(
-            "tmpfs",
-            root,
-            "tmpfs",
-            MountFlags::NOSUID | MountFlags::NODEV,
-            Some(c"mode=0755,size=1m"),
-        )
-        .unwrap_or_else(|e| fail("mounting the root tmpfs", e));
         let inside = |p: &Path| root.join(p.strip_prefix("/").unwrap_or(p));
-        let Program::Bound { host, target } = &plan.spec.command.program else {
-            fail("the program", "Root::Empty runs a bound program")
+        let create = match &plan.spec.root {
+            Root::Empty => {
+                mount(
+                    "tmpfs",
+                    root,
+                    "tmpfs",
+                    MountFlags::NOSUID | MountFlags::NODEV,
+                    Some(c"mode=0755,size=1m"),
+                )
+                .unwrap_or_else(|e| fail("mounting the root tmpfs", e));
+                let Program::Bound { host, target } = &plan.spec.command.program else {
+                    fail("the program", "Root::Empty runs a bound program")
+                };
+                attach(host, &inside(target), false, true);
+                true
+            }
+            Root::Host => {
+                host_root(root);
+                false
+            }
+            Root::Overlay { .. } => fail("Root::Overlay", "not implemented yet"),
         };
-        attach(host, &inside(target), false);
         for m in &plan.spec.mounts {
             match m {
                 Mount::Bind {
                     source,
                     target,
                     writable,
-                } => attach(source, &inside(target), *writable),
+                } => attach(source, &inside(target), *writable, create),
                 Mount::Tmpfs { target, size_mib } => tmpfs(&inside(target), *size_mib),
             }
         }
-        let old = root.join("old-root");
-        fs::create_dir_all(&old).unwrap_or_else(|e| fail("mkdir old-root", e));
-        pivot_root(root, &old).unwrap_or_else(|e| fail("pivot_root", e));
+        // pivot_root(".", ".") stacks the old root under the new one, so the new root needs no
+        // directory for it (a read-only root could not hold one).
+        std::env::set_current_dir(root).unwrap_or_else(|e| fail("chdir to the root", e));
+        pivot_root(".", ".").unwrap_or_else(|e| fail("pivot_root", e));
+        unmount(".", UnmountFlags::DETACH).unwrap_or_else(|e| fail("detaching the old root", e));
         std::env::set_current_dir("/").unwrap_or_else(|e| fail("chdir /", e));
-        unmount("/old-root", UnmountFlags::DETACH).unwrap_or_else(|e| fail("detaching the old root", e));
-        fs::remove_dir("/old-root").unwrap_or_else(|e| fail("removing old-root", e));
-        mount_remount("/", MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV, "")
-            .unwrap_or_else(|e| fail("making the root read-only", e));
-        limit(Resource::Nofile, "open files", plan.spec.limits.open_files);
-        limit(Resource::Nproc, "processes", plan.spec.limits.processes);
-        limit(Resource::Core, "core dumps", 0);
-        leave_session_keyring();
+        if plan.spec.root == Root::Empty {
+            mount_remount("/", MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV, "")
+                .unwrap_or_else(|e| fail("making the root read-only", e));
+        }
+    }
+
+    /// The kernel's `struct mount_attr` (MOUNT_ATTR_SIZE_VER0).
+    #[repr(C)]
+    struct MountAttr {
+        attr_set: u64,
+        attr_clr: u64,
+        propagation: u64,
+        userns_fd: u64,
+    }
+
+    const MOUNT_ATTR_RDONLY: u64 = 0x1;
+    const MOUNT_ATTR_NOSUID: u64 = 0x2;
+    const AT_RECURSIVE: libc::c_uint = 0x8000;
+
+    /// Sets `attrs` on every mount of the detached tree `tree`.
+    fn set_tree_attrs(tree: &std::os::fd::OwnedFd, attrs: u64) {
+        let attr = MountAttr {
+            attr_set: attrs,
+            attr_clr: 0,
+            propagation: 0,
+            userns_fd: 0,
+        };
+        #[allow(unsafe_code)]
+        // SAFETY: mount_setattr reads `size_of::<MountAttr>()` bytes from `attr`, a live
+        // `repr(C)` value with the layout of the kernel's `struct mount_attr`; the path is an empty
+        // C string (with AT_EMPTY_PATH the descriptor itself is the target), and `tree` is open.
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_mount_setattr,
+                tree.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH as libc::c_uint | AT_RECURSIVE,
+                &attr as *const MountAttr,
+                std::mem::size_of::<MountAttr>(),
+            )
+        };
+        if r < 0 {
+            fail("making the host tree read-only", std::io::Error::last_os_error());
+        }
+    }
+
+    /// The host's tree, recursively read-only and nosuid, on `root`, with the sandbox's own `/proc`.
+    fn host_root(root: &Path) {
+        let tree = open_tree(
+            CWD,
+            "/",
+            OpenTreeFlags::OPEN_TREE_CLONE | OpenTreeFlags::OPEN_TREE_CLOEXEC | OpenTreeFlags::AT_RECURSIVE,
+        )
+        .unwrap_or_else(|e| fail("cloning the host tree", e));
+        set_tree_attrs(&tree, MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID);
+        move_mount(&tree, "", CWD, root, MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH)
+            .unwrap_or_else(|e| fail("attaching the host tree", e));
+        mount(
+            "proc",
+            root.join("proc"),
+            "proc",
+            MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+            None,
+        )
+        .unwrap_or_else(|e| fail("mounting /proc", e));
+    }
+
+    /// Forks this single-threaded process; `None` in the child.
+    fn fork() -> Option<rustix::process::Pid> {
+        #[allow(unsafe_code)]
+        // SAFETY: the helper never starts threads, so the child inherits no lock another thread
+        // holds; it only makes system calls and allocates before it execs or exits.
+        let pid = unsafe { libc::fork() };
+        match pid {
+            -1 => fail("fork", std::io::Error::last_os_error()),
+            0 => None,
+            p => rustix::process::Pid::from_raw(p),
+        }
+    }
+
+    /// As PID 1: starts the program, reaps every process until the program ends, reports how it
+    /// ended on `control`, and ends the same way (which ends everything else in the namespace).
+    fn supervise(plan: &Plan, control: UnixStream) -> ! {
+        let Some(program) = fork() else { exec_program(plan) };
+        let status = loop {
+            match rustix::process::waitpid(None, rustix::process::WaitOptions::empty()) {
+                Ok(Some((pid, status))) if pid == program => break status,
+                Ok(_) => {}
+                Err(rustix::io::Errno::INTR) => {}
+                Err(e) => fail("waiting for the program", e),
+            }
+        };
+        let status = ExitStatus::from_raw(status.as_raw() as i32);
+        let report = match (status.code(), status.signal()) {
+            (Some(code), _) => format!("exit {code}\n"),
+            (None, Some(sig)) => format!("signal {sig}\n"),
+            (None, None) => "exit 1\n".to_string(),
+        };
+        let _ = (&control).write_all(report.as_bytes());
+        drop(control);
+        std::process::exit(status.code().unwrap_or(128 + status.signal().unwrap_or(0)));
+    }
+
+    /// Becomes the program: its ids, working directory and no new privileges, then exec.
+    fn exec_program(plan: &Plan) -> ! {
+        let command = &plan.spec.command;
+        let (path, file) = match &command.program {
+            Program::Bound { host, target } => (target, host.file_name()),
+            Program::Path(p) => (p, p.file_name()),
+        };
+        if let Some(u) = &command.user {
+            let groups: Vec<Gid> = u.groups.iter().map(|&g| Gid::from_raw(g)).collect();
+            set_thread_groups(&groups).unwrap_or_else(|e| fail("setgroups", e));
+            let gid = Gid::from_raw(u.gid);
+            set_thread_res_gid(gid, gid, gid).unwrap_or_else(|e| fail("setresgid", e));
+            let uid = Uid::from_raw(u.uid);
+            set_thread_res_uid(uid, uid, uid).unwrap_or_else(|e| fail("setresuid", e));
+        }
+        std::env::set_current_dir(&command.cwd)
+            .unwrap_or_else(|e| fail(&format!("chdir {}", command.cwd.display()), e));
         set_no_new_privs(true).unwrap_or_else(|e| fail("no_new_privs", e));
-        // The VMM gets no capabilities: no ambient set, and exec as a non-root user.
+        // No ambient or inheritable capabilities: a non-root program has none after exec.
         clear_ambient_capability_set().unwrap_or_else(|e| fail("clearing ambient capabilities", e));
         let mut caps = capabilities(None).unwrap_or_else(|e| fail("reading capabilities", e));
         caps.inheritable = CapabilitySet::empty();
         set_capabilities(None, caps).unwrap_or_else(|e| fail("clearing inheritable capabilities", e));
-        let command = &plan.spec.command;
-        std::env::set_current_dir(&command.cwd)
-            .unwrap_or_else(|e| fail(&format!("chdir {}", command.cwd.display()), e));
-        let name = command.arg0.clone().unwrap_or_else(|| {
-            host.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "vmm".into())
-        });
-        let mut exec = Command::new(target);
+        let name = command
+            .arg0
+            .clone()
+            .unwrap_or_else(|| file.map_or_else(|| "program".into(), |n| n.to_string_lossy().into_owned()));
+        let mut exec = Command::new(path);
         exec.arg0(name).args(&command.args).stdin(Stdio::inherit());
         if let Some(env) = &command.env {
             exec.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
