@@ -546,8 +546,8 @@ fn resolve_subids(count: u32) -> Result<SubidPlan> {
 #[doc(hidden)]
 pub fn plan(spec: &Spec) -> Result<Plan> {
     spec.check().map_err(Error::InvalidSpec)?;
-    if spec.seccomp {
-        return Err(Error::Unsupported("seccomp for sandboxed programs"));
+    if spec.seccomp && !cfg!(target_os = "linux") {
+        return Err(Error::Unsupported("seccomp outside Linux"));
     }
     Ok(Plan {
         spec: spec.clone(),

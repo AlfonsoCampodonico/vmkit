@@ -550,3 +550,23 @@ fn loopback_is_up_without_a_network() {
     let out = t.run_overlay("cat /sys/class/net/lo/operstate", Vec::new());
     assert_eq!(out.stdout.trim(), "unknown", "{}", out.stderr);
 }
+
+#[test]
+fn seccomp_denies_namespaces_and_mounts_but_not_ordinary_work() {
+    let Some(t) = Fixture::new() else { return };
+    // Un-nested, root in the sandbox may unshare and mount (see the control above); seccomp must refuse.
+    let mut s = t.overlay_spec(
+        "unshare -n true 2>&1; mount -t tmpfs t /tmp 2>&1; echo ok >/tmp/f && cat /tmp/f && sleep 0.1 \
+         && ls / >/dev/null && echo done",
+    );
+    s.seccomp = true;
+    let out = t.output(&s);
+    // busybox words the two EPERMs differently.
+    assert!(
+        out.stdout.contains("unshare(0x40000000): Operation not permitted"),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("mount: permission denied"), "{}", out.stdout);
+    assert!(out.stdout.ends_with("ok\ndone\n"), "{}", out.stdout);
+}

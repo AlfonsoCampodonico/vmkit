@@ -11,6 +11,9 @@ pub mod net;
 mod process;
 #[doc(hidden)]
 pub mod sandbox;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub mod seccomp;
 mod spec;
 mod subid;
 mod vmm;

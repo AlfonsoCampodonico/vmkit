@@ -871,6 +871,9 @@ mod linux {
         let mut caps = capabilities(None).unwrap_or_else(|e| fail("reading capabilities", e));
         caps.inheritable = CapabilitySet::empty();
         set_capabilities(None, caps).unwrap_or_else(|e| fail("clearing inheritable capabilities", e));
+        if plan.spec.seccomp {
+            vmkit::seccomp::apply().unwrap_or_else(|e| fail("seccomp", e));
+        }
         let name = command
             .arg0
             .clone()

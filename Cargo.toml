@@ -17,3 +17,4 @@ tempfile = "3.27.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.5", features = ["thread", "mount", "process", "fs", "stdio"] }
+seccompiler = "0.5"
