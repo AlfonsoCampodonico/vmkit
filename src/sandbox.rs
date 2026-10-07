@@ -54,7 +54,9 @@ pub struct Command {
     /// `argv[0]`; defaults to the program's file name.
     pub arg0: Option<String>,
     pub args: Vec<String>,
-    /// The program's whole environment, or `None` to inherit the caller's.
+    /// The program's whole environment, or `None` to inherit the caller's (only under
+    /// [`Ids::Caller`]: a program with subordinate ids is untrusted, and must not see the caller's
+    /// credentials and tokens).
     pub env: Option<Vec<(String, String)>>,
     /// The working directory inside the sandbox: absolute, without `.` or `..`.
     pub cwd: PathBuf,
@@ -219,6 +221,11 @@ impl Spec {
                 }
             }
             Ids::Subordinate { count } => {
+                if c.env.is_none() {
+                    return Err(
+                        "give the program its environment: Ids::Subordinate does not inherit the caller's".into(),
+                    );
+                }
                 if count == 0 || count == u32::MAX {
                     return Err(format!("{count} subordinate ids cannot be mapped"));
                 }
@@ -790,6 +797,10 @@ mod tests {
             (
                 "relative program path",
                 Box::new(|s| s.command.program = Program::Path("sh".into())),
+            ),
+            (
+                "an inherited environment with subordinate ids",
+                Box::new(|s| s.command.env = None),
             ),
         ];
         for (what, mutate) in cases {
