@@ -68,6 +68,12 @@ impl Cidr {
     pub fn prefix(&self) -> u8 {
         self.prefix
     }
+
+    /// Whether `addr` is in this network.
+    pub fn contains(&self, addr: Ipv4Addr) -> bool {
+        let mask = u32::MAX.checked_shl(32 - u32::from(self.prefix)).unwrap_or(0);
+        u32::from(addr) & mask == u32::from(self.addr)
+    }
 }
 
 impl FromStr for Cidr {
@@ -131,10 +137,15 @@ impl Protocol {
     }
 }
 
-/// Host port `host` reaches guest port `guest` (`-p HOST:GUEST/proto`).
+/// Host port `host`, listened on at `address`, reaches guest port `guest`
+/// (`-p ADDRESS:HOST:GUEST/proto`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortForward {
     pub protocol: Protocol,
+    /// The host address `pasta` listens on: [`Ipv4Addr::LOCALHOST`] keeps the port to this
+    /// host, [`Ipv4Addr::UNSPECIFIED`] listens on every address. It must be one of the
+    /// host's own addresses (or unspecified); `pasta` fails to start otherwise.
+    pub address: Ipv4Addr,
     pub host: u16,
     pub guest: u16,
 }
@@ -149,7 +160,8 @@ pub struct NetSpec {
 }
 
 impl NetSpec {
-    /// Rejects forwards the namespace cannot hold: port 0, or a host port used twice.
+    /// Rejects forwards the namespace cannot hold: port 0, or a host port used twice. A
+    /// port is used twice even on two addresses: the namespace sees only the port.
     pub(crate) fn check(&self) -> Result<(), String> {
         for (i, f) in self.forwards.iter().enumerate() {
             if f.host == 0 || f.guest == 0 {
@@ -160,6 +172,26 @@ impl NetSpec {
                 .any(|g| g.protocol == f.protocol && g.host == f.host)
             {
                 return Err(format!("host port {} is forwarded twice", f.host));
+            }
+        }
+        Ok(())
+    }
+
+    /// Rejects an `allow` entry that is only one of `copied`, the host addresses `pasta
+    /// --config-net` copies into the VM's namespace ([`outbound_address`]): packets to
+    /// them never leave the namespace, so such an exception could never work. A wider
+    /// entry that includes one still works for its other addresses; callers may warn.
+    /// Under `Open`, `allow` is unused and nothing is checked.
+    pub fn check_allow(&self, copied: &[Ipv4Addr]) -> Result<(), String> {
+        if self.egress == Egress::Open {
+            return Ok(());
+        }
+        for c in &self.allow {
+            if let Some(a) = copied.iter().find(|a| c.prefix() == 32 && c.addr() == **a) {
+                return Err(format!(
+                    "the egress exception {c} is the host's own address {a}, which the VM can never reach \
+                     (pasta gives the VM's namespace that address)"
+                ));
             }
         }
         Ok(())
@@ -286,20 +318,22 @@ pub fn ruleset(spec: &NetSpec, host: &[Ipv4Addr]) -> String {
 /// `pasta` options, without the namespace to attach to.
 #[doc(hidden)]
 pub fn pasta_args(spec: &NetSpec) -> Vec<String> {
-    let ports = |p: Protocol| {
+    // One `--tcp-ports ADDRESS/PORT` per forward: pasta binds each to its own address.
+    let ports = |flag: &str, p: Protocol| {
         let list: Vec<String> = spec
             .forwards
             .iter()
             .filter(|f| f.protocol == p)
-            .map(|f| f.host.to_string())
+            .map(|f| format!("{}/{}", f.address, f.host))
             .collect();
-        if list.is_empty() {
-            "none".to_string()
+        let list = if list.is_empty() {
+            vec!["none".to_string()]
         } else {
-            list.join(",")
-        }
+            list
+        };
+        list.into_iter().flat_map(|l| [flag.to_string(), l]).collect::<Vec<_>>()
     };
-    [
+    let mut args: Vec<String> = [
         "--config-net",
         "--ns-ifname",
         EGRESS,
@@ -313,13 +347,25 @@ pub fn pasta_args(spec: &NetSpec) -> Vec<String> {
         "--dns-forward",
         &DNS_FORWARD.to_string(),
         "--quiet",
-        "--tcp-ports",
-        &ports(Protocol::Tcp),
-        "--udp-ports",
-        &ports(Protocol::Udp),
     ]
     .map(String::from)
-    .to_vec()
+    .to_vec();
+    args.extend(ports("--tcp-ports", Protocol::Tcp));
+    args.extend(ports("--udp-ports", Protocol::Udp));
+    args
+}
+
+/// The host's address on its default route (the source address of outbound traffic),
+/// which `pasta --config-net` copies into the VM's namespace, so the guest can never
+/// reach it ([`NetSpec::check_allow`]). `None` without a default route. No packet is sent.
+pub fn outbound_address() -> Option<Ipv4Addr> {
+    let s = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    // TEST-NET-1: routed by the default route, never by a more specific one.
+    s.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+    match s.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(a) if !a.is_unspecified() => Some(a),
+        _ => None,
+    }
 }
 
 /// The host's local IPv4 addresses, from `/proc/net/fib_trie`.
@@ -452,13 +498,21 @@ mod tests {
             forwards: vec![
                 PortForward {
                     protocol: Protocol::Tcp,
+                    address: Ipv4Addr::LOCALHOST,
                     host: 8080,
                     guest: 80,
                 },
                 PortForward {
                     protocol: Protocol::Udp,
+                    address: Ipv4Addr::UNSPECIFIED,
                     host: 5353,
                     guest: 53,
+                },
+                PortForward {
+                    protocol: Protocol::Tcp,
+                    address: Ipv4Addr::new(192, 168, 5, 15),
+                    host: 8443,
+                    guest: 443,
                 },
             ],
             ..NetSpec::default()
@@ -472,21 +526,68 @@ mod tests {
             r.contains("    fib daddr type local udp dport 5353 dnat ip to 172.30.0.2:53"),
             "{r}"
         );
-        let args = pasta_args(&spec);
-        let after = |flag: &str| args[args.iter().position(|a| a == flag).unwrap() + 1].clone();
-        assert_eq!(
-            (after("--tcp-ports"), after("--udp-ports")),
-            ("8080".into(), "5353".into())
+        // The namespace side is the same whatever address pasta listens on.
+        assert!(
+            r.contains("iifname != \"tap0\" fib daddr type local tcp dport 8443 dnat ip to 172.30.0.2:443"),
+            "{r}"
         );
-        assert_eq!(after("--tcp-ns"), "none");
+        let args = pasta_args(&spec);
+        let all =
+            |flag: &str| -> Vec<String> { args.windows(2).filter(|w| w[0] == flag).map(|w| w[1].clone()).collect() };
+        // One spec per forward, each bound to its own address.
+        assert_eq!(all("--tcp-ports"), ["127.0.0.1/8080", "192.168.5.15/8443"]);
+        assert_eq!(all("--udp-ports"), ["0.0.0.0/5353"]);
+        assert_eq!(all("--tcp-ns"), ["none"]);
         let none = pasta_args(&NetSpec::default());
-        assert_eq!(none[none.iter().position(|a| a == "--tcp-ports").unwrap() + 1], "none");
+        let flags = |flag: &str| -> Vec<&String> { none.windows(2).filter(|w| w[0] == flag).map(|w| &w[1]).collect() };
+        assert_eq!(flags("--tcp-ports"), ["none"]);
+        assert_eq!(flags("--udp-ports"), ["none"]);
+    }
+
+    #[test]
+    fn an_allow_entry_that_is_the_hosts_outbound_address_is_refused() {
+        let copied = ["192.168.5.15".parse().unwrap()];
+        let spec = |egress, allow: &[&str]| NetSpec {
+            egress,
+            allow: allow.iter().map(|a| a.parse().unwrap()).collect(),
+            ..NetSpec::default()
+        };
+        assert!(
+            spec(Egress::Restricted, &["10.9.0.0/16", "1.1.1.1"])
+                .check_allow(&copied)
+                .is_ok()
+        );
+        let e = spec(Egress::DenyAll, &["10.9.0.0/16", "192.168.5.15"])
+            .check_allow(&copied)
+            .unwrap_err();
+        assert!(
+            e.contains("192.168.5.15/32 is the host's own address 192.168.5.15"),
+            "{e}"
+        );
+        // A wider entry still reaches its other addresses; other host addresses (not
+        // copied into the namespace) are reachable with an exception.
+        assert!(
+            spec(Egress::DenyAll, &["192.168.0.0/16", "10.250.0.1"])
+                .check_allow(&copied)
+                .is_ok()
+        );
+        // `open` ignores `allow`.
+        assert!(spec(Egress::Open, &["192.168.5.15"]).check_allow(&copied).is_ok());
+        let c: Cidr = "192.168.4.0/23".parse().unwrap();
+        assert!(c.contains("192.168.5.255".parse().unwrap()) && !c.contains("192.168.6.0".parse().unwrap()));
+        assert!(
+            "0.0.0.0/0"
+                .parse::<Cidr>()
+                .unwrap()
+                .contains("8.8.8.8".parse().unwrap())
+        );
     }
 
     #[test]
     fn duplicate_or_zero_ports_are_refused() {
         let fwd = |host, guest| PortForward {
             protocol: Protocol::Tcp,
+            address: Ipv4Addr::LOCALHOST,
             host,
             guest,
         };
@@ -503,6 +604,10 @@ mod tests {
             spec(vec![fwd(80, 80), udp]).check().is_ok(),
             "tcp and udp ports are separate"
         );
+        // The namespace sees only the port, so two addresses cannot share it.
+        let mut other = fwd(80, 81);
+        other.address = Ipv4Addr::UNSPECIFIED;
+        assert!(spec(vec![fwd(80, 80), other]).check().is_err());
     }
 
     #[test]

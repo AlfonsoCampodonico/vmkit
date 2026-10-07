@@ -32,7 +32,8 @@ pub struct VmSpec {
     pub vsock: Option<VsockSpec>,
     /// A NIC in the VM's own network namespace (kiln spec §9.3).
     pub net: Option<NetSpec>,
-    /// Guest serial output is appended here.
+    /// Guest serial output is appended here. It is opened (create, append) in the caller's
+    /// process before the VMM starts, so it may be a FIFO the caller reads.
     pub console_log: PathBuf,
     /// A private (0700) directory for this VM's sandbox plan and logs; it must exist.
     /// The VMM itself sees only `<run_dir>/sock`, its sockets and own logs.
@@ -265,6 +266,7 @@ mod tests {
         let mut s = spec(0);
         let fwd = PortForward {
             protocol: Protocol::Tcp,
+            address: std::net::Ipv4Addr::LOCALHOST,
             host: 8080,
             guest: 80,
         };
