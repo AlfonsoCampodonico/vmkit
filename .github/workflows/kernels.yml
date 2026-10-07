@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y busybox-static flex bison bc libelf-dev libssl-dev cpio file
+      - run: sudo apt-get update && sudo apt-get install -y busybox-static flex bison bc libelf-dev libssl-dev cpio file uidmap
       - run: sudo apt-get install -y gcc-aarch64-linux-gnu
       - run: kernels/build.sh ${{ matrix.arch }} out
       - name: Boot test on both VMMs (x86_64)
@@ -32,7 +32,10 @@ jobs:
           sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
           scripts/install-vmms.sh "$HOME/.local/bin"
           testguest/build-initramfs.sh out/initramfs-x86_64.cpio.gz
-          export PATH="$HOME/.local/bin:$PATH"
+          # Every VMM runs in the sandbox helper (M2b); Ubuntu 24.04 needs its AppArmor profile.
+          cargo build --bin vmkit-sandbox
+          scripts/install-apparmor.sh "$PWD/target/debug/vmkit-sandbox"
+          export PATH="$HOME/.local/bin:$PATH" VMKIT_SANDBOX=$PWD/target/debug/vmkit-sandbox
           export VMKIT_TEST_KERNEL=$(ls out/vmlinux-*-x86_64) VMKIT_TEST_INITRAMFS=out/initramfs-x86_64.cpio.gz VMKIT_REQUIRE_KVM_TESTS=1
           # About half the CPUs: one VM per test, and private-repo hosted runners have two vCPUs.
           cargo test --test contract -- --test-threads=$(( $(nproc) > 1 ? $(nproc) / 2 : 1 ))
