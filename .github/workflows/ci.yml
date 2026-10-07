@@ -28,7 +28,12 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - run: sudo apt-get update && sudo apt-get install -y busybox-static flex bison bc libelf-dev libssl-dev cpio file passt nftables
+      - run: sudo apt-get update && sudo apt-get install -y busybox-static flex bison bc libelf-dev libssl-dev cpio file passt nftables uidmap
+      - name: A subordinate id range for the runner user
+        run: |
+          grep -q "^$USER:" /etc/subuid || echo "$USER:200000:65536" | sudo tee -a /etc/subuid
+          grep -q "^$USER:" /etc/subgid || echo "$USER:200000:65536" | sudo tee -a /etc/subgid
+          grep "^$USER:" /etc/subuid /etc/subgid
       - run: scripts/install-vmms.sh "$HOME/.local/bin"
       - uses: actions/cache@v4
         with:
@@ -51,6 +56,7 @@ jobs:
           export VMKIT_TEST_KERNEL=$(ls out/vmlinux-*-x86_64) VMKIT_TEST_INITRAMFS=out/initramfs-x86_64.cpio.gz VMKIT_REQUIRE_KVM_TESTS=1
           threads=$(( $(nproc) > 1 ? $(nproc) / 2 : 1 ))
           cargo test --test sandbox
+          cargo test --test exec
           cargo test --test contract -- --test-threads=$threads
           cargo test --test network -- --test-threads=$threads
           cargo test --test pause -- --test-threads=1

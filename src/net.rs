@@ -5,6 +5,8 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
+
 /// The tap device in the VM's namespace.
 pub const TAP: &str = "tap0";
 /// The namespace's address on the tap: the guest's gateway and DNS server.
@@ -19,6 +21,8 @@ pub const GUEST_MAC: &str = "06:00:ac:1e:00:02";
 pub(crate) const EGRESS: &str = "egress0";
 /// Where `pasta` answers DNS in the namespace; guest queries to the gateway are sent here.
 pub(crate) const DNS_FORWARD: Ipv4Addr = Ipv4Addr::new(169, 254, 1, 53);
+/// The DNS server for programs in a namespace with egress but no tap (`resolv.conf`'s nameserver).
+pub const NAMESERVER: Ipv4Addr = DNS_FORWARD;
 
 /// Destinations the default `restricted` egress denies, besides the host's own addresses.
 const RESTRICTED: [&str; 10] = [
@@ -35,7 +39,8 @@ const RESTRICTED: [&str; 10] = [
 ];
 
 /// An IPv4 network such as `10.0.0.0/8`; a bare address is a `/32`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Cidr {
     addr: Ipv4Addr,
     prefix: u8,
@@ -78,6 +83,20 @@ impl FromStr for Cidr {
     }
 }
 
+impl TryFrom<String> for Cidr {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, String> {
+        s.parse()
+    }
+}
+
+impl From<Cidr> for String {
+    fn from(c: Cidr) -> String {
+        c.to_string()
+    }
+}
+
 impl fmt::Display for Cidr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.addr, self.prefix)
@@ -85,7 +104,7 @@ impl fmt::Display for Cidr {
 }
 
 /// What the guest may reach (`--egress`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Egress {
     /// Everything except link-local (cloud metadata), CGNAT, RFC 1918, `0/8`,
     /// loopback, multicast and reserved ranges, and the host's own addresses.
@@ -97,7 +116,7 @@ pub enum Egress {
     Open,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Protocol {
     Tcp,
     Udp,
@@ -113,7 +132,7 @@ impl Protocol {
 }
 
 /// Host port `host` reaches guest port `guest` (`-p HOST:GUEST/proto`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortForward {
     pub protocol: Protocol,
     pub host: u16,
@@ -121,7 +140,7 @@ pub struct PortForward {
 }
 
 /// A network interface for the guest, `eth0` at [`GUEST`]/[`PREFIX`] via [`GATEWAY`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NetSpec {
     pub egress: Egress,
     /// Exceptions to `Restricted` and `DenyAll`; ignored under `Egress::Open`.
@@ -153,8 +172,9 @@ impl NetSpec {
 /// `forward` polices the guest. `local_out` stops the namespace's own processes (the VMM)
 /// from opening any connection through pasta; their replies to forwarded connections are
 /// not new, and spliced forwards leave through loopback and the tap, not `egress0`.
-#[doc(hidden)]
-pub fn ruleset(spec: &NetSpec, host: &[Ipv4Addr]) -> String {
+/// The `elements = { ... }` of the deny and allow sets for `spec`; `host` lists the host's own
+/// addresses, which `Restricted` denies.
+fn sets(spec: &NetSpec, host: &[Ipv4Addr]) -> (String, String) {
     let set = |items: Vec<String>| {
         if items.is_empty() {
             String::new()
@@ -175,6 +195,43 @@ pub fn ruleset(spec: &NetSpec, host: &[Ipv4Addr]) -> String {
         Egress::Open => Vec::new(),
         _ => spec.allow.iter().map(Cidr::to_string).collect(),
     };
+    (set(deny), set(allow))
+}
+
+/// The nftables ruleset for a namespace without a tap, whose own processes reach out through
+/// `pasta`: loopback and DNS at [`NAMESERVER`] are allowed, then the allow set, then the deny
+/// set; IPv6 is dropped and nothing new comes in.
+#[doc(hidden)]
+pub fn egress_ruleset(spec: &NetSpec, host: &[Ipv4Addr]) -> String {
+    let (deny, allow) = sets(spec, host);
+    format!(
+        "table inet vmkit {{
+  set deny {{ type ipv4_addr; flags interval; auto-merge;{deny} }}
+  set allow {{ type ipv4_addr; flags interval; auto-merge;{allow} }}
+  chain output {{
+    type filter hook output priority filter; policy drop;
+    oifname \"lo\" accept
+    meta nfproto ipv6 drop
+    ct state established,related accept
+    ip daddr {NAMESERVER} udp dport 53 accept
+    ip daddr {NAMESERVER} tcp dport 53 accept
+    oifname \"{EGRESS}\" ip daddr @allow accept
+    oifname \"{EGRESS}\" ip daddr @deny drop
+    oifname \"{EGRESS}\" accept
+  }}
+  chain input {{
+    type filter hook input priority filter; policy drop;
+    iifname \"lo\" accept
+    ct state established,related accept
+  }}
+}}
+"
+    )
+}
+
+#[doc(hidden)]
+pub fn ruleset(spec: &NetSpec, host: &[Ipv4Addr]) -> String {
+    let (deny, allow) = sets(spec, host);
     let mut prerouting = String::new();
     let mut output = String::new();
     for proto in ["udp", "tcp"] {
@@ -223,8 +280,6 @@ pub fn ruleset(spec: &NetSpec, host: &[Ipv4Addr]) -> String {
   }}
 }}
 ",
-        deny = set(deny),
-        allow = set(allow),
     )
 }
 
@@ -288,6 +343,35 @@ pub(crate) fn host_addresses(fib_trie: &str) -> Vec<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_egress_ruleset_polices_the_namespaces_own_traffic() {
+        let r = egress_ruleset(&NetSpec::default(), &[Ipv4Addr::new(192, 168, 5, 15)]);
+        assert!(
+            r.contains("type filter hook output priority filter; policy drop;"),
+            "{r}"
+        );
+        assert!(r.contains("192.168.5.15"));
+        assert!(r.contains("169.254.0.0/16"));
+        assert!(r.contains(&format!("ip daddr {NAMESERVER} udp dport 53 accept")));
+        assert!(!r.contains(TAP), "a bare namespace has no tap");
+        let open = egress_ruleset(
+            &NetSpec {
+                egress: Egress::Open,
+                ..Default::default()
+            },
+            &[],
+        );
+        assert!(!open.contains("169.254.0.0/16"));
+        let allowed = egress_ruleset(
+            &NetSpec {
+                allow: vec!["198.51.100.7".parse().unwrap()],
+                ..Default::default()
+            },
+            &[],
+        );
+        assert!(allowed.contains("198.51.100.7/32"), "{allowed}");
+    }
 
     #[test]
     fn cidrs_parse_and_normalise() {

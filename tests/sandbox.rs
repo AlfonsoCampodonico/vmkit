@@ -10,11 +10,11 @@
 
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use vmkit::NetSpec;
-use vmkit::sandbox::{Bind, Limits, NetPlan, Plan};
+use vmkit::sandbox::{self, Ids, Limits, Mount, Network, Program, Root, Spec};
 
 const BUSYBOX: &str = "/usr/bin/busybox";
 /// Set in the environment of the probe below when it runs as the VMM.
@@ -45,44 +45,59 @@ impl Sandbox {
     }
 
     /// Busybox running `applet args...` with `/dev/null`, a read-only `/vm/data` and a writable `/vm/sock`.
-    fn plan(&self, args: &[&str]) -> Plan {
-        let bind = |source: PathBuf, target: &str, writable| Bind {
+    fn spec(&self, args: &[&str]) -> Spec {
+        let bind = |source: PathBuf, target: &str, writable| Mount::Bind {
             source,
             target: target.into(),
             writable,
         };
-        Plan {
-            vmm: BUSYBOX.into(),
-            args: args.iter().map(|a| a.to_string()).collect(),
-            binds: vec![
+        Spec {
+            command: sandbox::Command {
+                program: Program::Bound {
+                    host: BUSYBOX.into(),
+                    target: "/vmm".into(),
+                },
+                arg0: None,
+                args: args.iter().map(|a| a.to_string()).collect(),
+                env: None,
+                cwd: "/".into(),
+                user: None,
+            },
+            root: Root::Empty,
+            mounts: vec![
                 bind("/dev/null".into(), "/dev/null", true),
                 bind(self.path("data"), "/vm/data", false),
                 bind(self.path("sock"), "/vm/sock", true),
             ],
+            ids: Ids::Caller,
+            network: Network::None,
+            nest: false,
+            seccomp: false,
             limits: Limits {
                 open_files: 64,
                 processes: 32,
+                cgroup: None,
             },
-            root: self.path("root"),
-            pid_file: self.path("vmm.pid"),
-            net: None,
+            run_dir: self.dir.path().to_path_buf(),
         }
     }
 
-    fn command(&self, plan: &Plan) -> Command {
-        let file = self.path("plan.json");
-        std::fs::write(&file, serde_json::to_vec(plan).unwrap()).unwrap();
-        let mut cmd = Command::new(&self.helper);
-        cmd.arg("run").arg(file).stdin(Stdio::null());
-        cmd
+    /// The library finds the helper through `VMKIT_SANDBOX`, which the suite requires anyway.
+    fn output(&self, spec: &Spec) -> Output {
+        assert_eq!(
+            std::env::var_os("VMKIT_SANDBOX").as_deref(),
+            Some(self.helper.as_os_str())
+        );
+        sandbox::spawn(spec, sandbox::Stdio::piped())
+            .unwrap()
+            .wait_with_output()
+            .unwrap()
     }
 
-    fn output(&self, plan: &Plan) -> Output {
-        self.command(plan).output().unwrap()
-    }
-
-    fn spawn(&self, plan: &Plan) -> Child {
-        self.command(plan).stdout(Stdio::null()).spawn().unwrap()
+    fn spawn(&self, spec: &Spec) -> sandbox::Sandbox {
+        let mut stdio = sandbox::Stdio::piped();
+        stdio.stdout = std::process::Stdio::null();
+        sandbox::spawn(spec, stdio).unwrap()
     }
 
     /// The VMM's `/proc` directory, once the helper has written its PID.
@@ -113,27 +128,6 @@ fn field(status: &str, name: &str) -> String {
         .unwrap_or_else(|| panic!("no {name}"))
         .trim()
         .to_string()
-}
-
-/// A system tool from the usual directories.
-fn find(name: &str) -> PathBuf {
-    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
-        .iter()
-        .map(|d| Path::new(d).join(name))
-        .find(|p| p.exists())
-        .unwrap_or_else(|| panic!("{name} not installed"))
-}
-
-fn net_plan(ruleset: String, pasta_args: Vec<String>) -> NetPlan {
-    NetPlan {
-        ip: find("ip"),
-        nft: find("nft"),
-        ruleset,
-        pasta: std::env::var_os("VMKIT_PASTA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| find("pasta")),
-        pasta_args,
-    }
 }
 
 /// The namespace (`ipc`, `uts`, ...) of the process whose `/proc` directory is `proc`.
@@ -173,7 +167,7 @@ fn gone(dir: &Path) -> bool {
 #[test]
 fn the_root_holds_only_the_binds() {
     let Some(s) = Sandbox::new() else { return };
-    let o = s.output(&s.plan(&["find", "/"]));
+    let o = s.output(&s.spec(&["find", "/"]));
     assert!(o.status.success(), "{o:?}");
     let mut seen: Vec<String> = stdout(&o).lines().map(String::from).collect();
     seen.sort();
@@ -184,7 +178,7 @@ fn the_root_holds_only_the_binds() {
 fn read_only_binds_stay_read_only_and_writable_ones_reach_the_host() {
     let Some(s) = Sandbox::new() else { return };
     // The temporary directory is on a nosuid,nodev tmpfs on most hosts: its locked flags must be kept.
-    let o = s.output(&s.plan(&["sh", "-c", "echo x > /vm/data"]));
+    let o = s.output(&s.spec(&["sh", "-c", "echo x > /vm/data"]));
     // Refused by the read-only mount itself, not by a helper failure (exit 125).
     assert!(!o.status.success() && o.status.code() != Some(125), "{o:?}");
     assert!(
@@ -192,7 +186,7 @@ fn read_only_binds_stay_read_only_and_writable_ones_reach_the_host() {
         "{o:?}"
     );
     assert_eq!(std::fs::read_to_string(s.path("data")).unwrap(), "ro");
-    let o = s.output(&s.plan(&["sh", "-c", "echo out > /vm/sock/out && echo x > /new"]));
+    let o = s.output(&s.spec(&["sh", "-c", "echo out > /vm/sock/out && echo x > /new"]));
     assert!(!o.status.success(), "the root is read-only");
     assert_eq!(std::fs::read_to_string(s.path("sock/out")).unwrap(), "out\n");
 }
@@ -200,8 +194,8 @@ fn read_only_binds_stay_read_only_and_writable_ones_reach_the_host() {
 #[test]
 fn exit_codes_and_signals_are_mirrored() {
     let Some(s) = Sandbox::new() else { return };
-    assert_eq!(s.output(&s.plan(&["sh", "-c", "exit 7"])).status.code(), Some(7));
-    let mut child = s.spawn(&s.plan(&["sleep", "30"]));
+    assert_eq!(s.output(&s.spec(&["sh", "-c", "exit 7"])).status.code(), Some(7));
+    let mut child = s.spawn(&s.spec(&["sleep", "30"]));
     let vmm = s.vmm_proc();
     let pid = vmm.file_name().unwrap().to_str().unwrap().to_string();
     // As PID 1 of its namespace the VMM takes only SIGKILL from outside it.
@@ -212,7 +206,7 @@ fn exit_codes_and_signals_are_mirrored() {
 #[test]
 fn the_vmm_has_no_privileges_and_dies_with_the_helper() {
     let Some(s) = Sandbox::new() else { return };
-    let mut child = s.spawn(&s.plan(&["sleep", "30"]));
+    let mut child = s.spawn(&s.spec(&["sleep", "30"]));
     let vmm = s.vmm_proc();
     let status = std::fs::read_to_string(vmm.join("status")).unwrap();
     for caps in ["CapInh", "CapPrm", "CapEff", "CapAmb"] {
@@ -264,7 +258,7 @@ fn inherited_descriptors_do_not_reach_the_vmm() {
     let Some(s) = Sandbox::new() else { return };
     let leaked = std::fs::File::open("/dev/null").unwrap();
     rustix::io::fcntl_setfd(&leaked, rustix::io::FdFlags::empty()).unwrap();
-    let mut child = s.spawn(&s.plan(&["sleep", "30"]));
+    let mut child = s.spawn(&s.spec(&["sleep", "30"]));
     let vmm = s.vmm_proc();
     let mut fds: Vec<String> = std::fs::read_dir(vmm.join("fd"))
         .unwrap()
@@ -280,9 +274,12 @@ fn inherited_descriptors_do_not_reach_the_vmm() {
 fn a_symlink_is_never_followed() {
     let Some(s) = Sandbox::new() else { return };
     std::os::unix::fs::symlink(s.path("data"), s.path("link")).unwrap();
-    let mut plan = s.plan(&["true"]);
-    plan.binds[1].source = s.path("link");
-    let o = s.output(&plan);
+    let mut spec = s.spec(&["true"]);
+    let Mount::Bind { source, .. } = &mut spec.mounts[1] else {
+        unreachable!()
+    };
+    *source = s.path("link");
+    let o = s.output(&spec);
     assert_eq!(o.status.code(), Some(125));
     assert!(String::from_utf8_lossy(&o.stderr).contains("is a symlink"), "{o:?}");
 }
@@ -290,28 +287,9 @@ fn a_symlink_is_never_followed() {
 #[test]
 fn the_network_namespace_gets_the_tap_and_pasta() {
     let Some(s) = Sandbox::new() else { return };
-    let mut plan = s.plan(&["ip", "-4", "-o", "addr"]);
-    plan.net = Some(net_plan(
-        "table inet vmkit { }\n".into(),
-        [
-            "--config-net",
-            "--ns-ifname",
-            "egress0",
-            "--ipv4-only",
-            "--quiet",
-            "--tcp-ports",
-            "none",
-            "--udp-ports",
-            "none",
-            "--tcp-ns",
-            "none",
-            "--udp-ns",
-            "none",
-        ]
-        .map(String::from)
-        .to_vec(),
-    ));
-    let o = s.output(&plan);
+    let mut spec = s.spec(&["ip", "-4", "-o", "addr"]);
+    spec.network = Network::Tap(NetSpec::default());
+    let o = s.output(&spec);
     assert!(o.status.success(), "{o:?}");
     let out = stdout(&o);
     assert!(out.contains("tap0") && out.contains("172.30.0.1/30"), "{out}");
@@ -340,9 +318,9 @@ fn the_vmm_opens_no_connection_through_pasta() {
     // Cloud metadata, a private host address and a public host address: the guest's policy
     // denies them all, and the VMM itself (the namespace's own process) reaches none.
     for addr in ["169.254.169.254", "10.250.0.1", "198.51.100.7"] {
-        let mut plan = s.plan(&["nc", "-w", "3", addr, &port]);
-        plan.net = Some(net_plan(vmkit::net::ruleset(&spec, &[]), vmkit::net::pasta_args(&spec)));
-        let o = s.output(&plan);
+        let mut sandboxed = s.spec(&["nc", "-w", "3", addr, &port]);
+        sandboxed.network = Network::Tap(spec.clone());
+        let o = s.output(&sandboxed);
         // busybox nc exits 1 when it cannot connect; 0 would be a connection, 125 a helper failure.
         assert_eq!(o.status.code(), Some(1), "the VMM reached {addr}:{port}: {o:?}");
     }
@@ -351,14 +329,14 @@ fn the_vmm_opens_no_connection_through_pasta() {
 #[test]
 fn the_vmm_cannot_create_user_namespaces() {
     let Some(s) = Sandbox::new() else { return };
-    let o = s.output(&s.plan(&["unshare", "-U", "true"]));
+    let o = s.output(&s.spec(&["unshare", "-U", "true"]));
     assert!(!o.status.success() && o.status.code() != Some(125), "{o:?}");
     assert!(
         String::from_utf8_lossy(&o.stderr).contains("No space left on device"),
         "max_user_namespaces is 0 in the sandbox: {o:?}"
     );
     // The control: everything else about the command works.
-    assert!(s.output(&s.plan(&["true"])).status.success());
+    assert!(s.output(&s.spec(&["true"])).status.success());
 }
 
 /// Not a test of its own: the VMM in `the_vmm_gets_a_session_keyring_of_its_own` prints its
@@ -401,7 +379,7 @@ fn the_vmm_gets_a_session_keyring_of_its_own() {
         .expect("no dynamic loader mapped")
         .clone();
     let dirs: Vec<String> = libs.iter().map(|p| p.parent().unwrap().display().to_string()).collect();
-    let mut plan = s.plan(&[
+    let mut spec = s.spec(&[
         "--library-path",
         &dirs.join(":"),
         "/probe",
@@ -410,18 +388,22 @@ fn the_vmm_gets_a_session_keyring_of_its_own() {
         "--nocapture",
         "--test-threads=1",
     ]);
-    plan.vmm = loader;
-    let bind = |source: PathBuf, target: PathBuf| Bind {
+    spec.command.program = Program::Bound {
+        host: loader,
+        target: "/vmm".into(),
+    };
+    spec.command.env = Some(vec![(PROBE.into(), "1".into())]);
+    let bind = |source: PathBuf, target: PathBuf| Mount::Bind {
         source,
         target,
         writable: false,
     };
-    plan.binds.push(bind(
+    spec.mounts.push(bind(
         std::env::current_exe().unwrap().canonicalize().unwrap(),
         "/probe".into(),
     ));
-    plan.binds.extend(libs.iter().map(|l| bind(l.clone(), l.clone())));
-    let o = s.command(&plan).env(PROBE, "1").output().unwrap();
+    spec.mounts.extend(libs.iter().map(|l| bind(l.clone(), l.clone())));
+    let o = s.output(&spec);
     assert!(o.status.success(), "{o:?}");
     // libtest prints the probe's line after its own `test ... ` on the same line.
     let out = stdout(&o);
