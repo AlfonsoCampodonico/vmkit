@@ -507,14 +507,17 @@ pub(crate) fn vmm_spec(spec: &VmSpec, vmm: &Path, args: &[String]) -> Spec {
     }
 }
 
-/// The policy half of a network plan: the ruleset for the host's current addresses.
-fn policy(ruleset: impl Fn(&[Ipv4Addr]) -> String, pasta_args: Vec<String>) -> Result<Policy> {
+/// The policy half of a network plan: the ruleset for the host's current addresses. An
+/// `allow` entry that is only the address pasta copies is refused ([`NetSpec::check_allow`]).
+fn policy(n: &NetSpec, ruleset: fn(&NetSpec, &[Ipv4Addr]) -> String) -> Result<Policy> {
+    n.check_allow(net::outbound_address().as_slice())
+        .map_err(Error::InvalidSpec)?;
     let host: Vec<Ipv4Addr> = net::host_addresses(&std::fs::read_to_string("/proc/net/fib_trie")?);
     Ok(Policy {
         nft: binary::find_system("nft")?,
-        ruleset: ruleset(&host),
+        ruleset: ruleset(n, &host),
         pasta: binary::find("pasta", "VMKIT_PASTA")?,
-        pasta_args,
+        pasta_args: net::pasta_args(n),
     })
 }
 
@@ -524,8 +527,8 @@ fn net_plan(spec: &Spec) -> Result<Option<NetPlan>> {
         // The VMM sandbox keeps loopback down (and needs no `ip`).
         Network::None if spec.root == Root::Empty => return Ok(None),
         Network::None => NetKind::Loopback,
-        Network::Tap(n) => NetKind::Tap(policy(|host| net::ruleset(n, host), net::pasta_args(n))?),
-        Network::Egress(n) => NetKind::Egress(policy(|host| net::egress_ruleset(n, host), net::pasta_args(n))?),
+        Network::Tap(n) => NetKind::Tap(policy(n, net::ruleset)?),
+        Network::Egress(n) => NetKind::Egress(policy(n, net::egress_ruleset)?),
     };
     Ok(Some(NetPlan {
         ip: binary::find_system("ip")?,
@@ -761,6 +764,7 @@ mod tests {
                     s.network = Network::Egress(NetSpec {
                         forwards: vec![net::PortForward {
                             protocol: net::Protocol::Tcp,
+                            address: Ipv4Addr::LOCALHOST,
                             host: 8080,
                             guest: 80,
                         }],

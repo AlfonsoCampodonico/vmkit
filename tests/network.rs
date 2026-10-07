@@ -10,7 +10,7 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use common::{Case, END};
@@ -170,6 +170,7 @@ fn port_forwards_reach_the_guest_but_other_vms_do_not(backend: Backend) {
     let net = NetSpec {
         forwards: vec![PortForward {
             protocol: Protocol::Tcp,
+            address: Ipv4Addr::UNSPECIFIED,
             host: host_port,
             guest: 8080,
         }],
@@ -205,6 +206,51 @@ fn port_forwards_reach_the_guest_but_other_vms_do_not(backend: Backend) {
     assert_pasta_gone(&netns);
 }
 
+fn a_forward_bound_to_loopback_is_reachable_only_there(backend: Backend) {
+    let Some(server) = net_case(backend) else { return };
+    let host_port = free_port();
+    let net = NetSpec {
+        forwards: vec![PortForward {
+            protocol: Protocol::Tcp,
+            address: Ipv4Addr::LOCALHOST,
+            host: host_port,
+            guest: 8080,
+        }],
+        ..NetSpec::default()
+    };
+    let spec = net_spec(&server, net, &["vmkit.serve=8080".into(), "vmkit.hold=60".into()]);
+    let mut vm: Box<dyn Vm> = server.vmm.create(&spec).expect("create");
+    vm.start().expect("start");
+    server.await_console("VMKIT-SERVING", 1);
+    fetch(&format!("127.0.0.1:{host_port}"));
+    // pasta listens on loopback only: the host's other addresses refuse the connection.
+    for addr in [HOST, PRIVATE] {
+        let err = TcpStream::connect_timeout(&format!("{addr}:{host_port}").parse().unwrap(), Duration::from_secs(5))
+            .expect_err("a loopback forward answered on another address");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused, "{addr}: {err}");
+    }
+    vm.kill().unwrap();
+    vm.wait_timeout(END).unwrap().expect("killed");
+}
+
+/// pasta copies the host's outbound address into the namespace, so an exception for it
+/// alone could never work: refused. (The fixture addresses on `lo` are not copied: the
+/// allow cases above reach them.)
+fn an_allow_entry_for_the_hosts_outbound_address_is_refused(backend: Backend) {
+    let Some(c) = net_case(backend) else { return };
+    let outbound = vmkit::net::outbound_address().expect("a default route");
+    let net = NetSpec {
+        egress: Egress::DenyAll,
+        allow: vec![Cidr::new(outbound, 32).unwrap()],
+        ..NetSpec::default()
+    };
+    let err = c.vmm.create(&net_spec(&c, net, &[])).err().expect("refused");
+    assert!(
+        matches!(&err, vmkit::Error::InvalidSpec(m) if m.contains(&format!("is the host's own address {outbound}"))),
+        "{err}"
+    );
+}
+
 /// The network namespace path of the VMM recorded in `run_dir`, if it got that far.
 fn netns_of(run_dir: &std::path::Path) -> Option<String> {
     let pid = std::fs::read_to_string(vmkit::sandbox::pid_file(run_dir)).ok()?;
@@ -235,6 +281,7 @@ fn a_host_port_in_use_fails_with_pastas_message(backend: Backend) {
     let net = NetSpec {
         forwards: vec![PortForward {
             protocol: Protocol::Tcp,
+            address: Ipv4Addr::UNSPECIFIED,
             host: taken.local_addr().unwrap().port(),
             guest: 80,
         }],
@@ -275,4 +322,6 @@ network!(
     deny_all_leaves_only_dns_and_open_removes_the_denies,
     port_forwards_reach_the_guest_but_other_vms_do_not,
     a_host_port_in_use_fails_with_pastas_message,
+    a_forward_bound_to_loopback_is_reachable_only_there,
+    an_allow_entry_for_the_hosts_outbound_address_is_refused,
 );
