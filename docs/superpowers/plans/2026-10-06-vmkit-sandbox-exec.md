@@ -1,7 +1,5 @@
 # vmkit generalised sandbox Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Make `vmkit::sandbox` a public, general-purpose rootless sandbox that runs any program, not only a VMM. It must support:
 - a subuid-mapped user namespace;
 - an overlay or read-only host root;
@@ -36,7 +34,6 @@ The VMM sandbox's original requirements are kiln spec §9.2/§9.3, and they stay
 - **Prerequisites:** a missing prerequisite (no `newuidmap`, no subuid range, a range smaller than `count`) is `Error::Unsupported`-class with a message naming it.
 - **Setup failures:** setup failures inside the helper exit 125 with one line `vmkit-sandbox: <what>: <why>` on stderr. A program's own exit code or signal is mirrored.
 - **Formatting:** rustfmt `max_width = 120` (existing `rustfmt.toml`); clippy `-D warnings` on all targets.
-- **Commits:** no Claude attribution trailers or footers (user preference).
 
 ## Review Focus
 
