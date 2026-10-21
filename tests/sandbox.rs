@@ -297,6 +297,30 @@ fn the_network_namespace_gets_the_tap_and_pasta() {
 }
 
 #[test]
+fn the_tap_has_the_ipv6_gateway_and_a_permanent_neighbour_for_the_guest() {
+    let Some(s) = Sandbox::new() else { return };
+    let run = |args: &[&str]| {
+        let mut spec = s.spec(args);
+        spec.network = Network::Tap(NetSpec::default());
+        let o = s.output(&spec);
+        assert!(o.status.success(), "{o:?}");
+        stdout(&o)
+    };
+    let addrs = run(&["ip", "-6", "-o", "addr", "show", "dev", "tap0"]);
+    assert!(addrs.contains("inet6 fd76:6d6b:6974::1/64 scope global"), "{addrs}");
+    assert!(
+        !addrs.contains("tentative"),
+        "no DAD on the gateway's address:\n{addrs}"
+    );
+    // The namespace never learns the guest's link-layer address from the guest.
+    let neigh = run(&["ip", "-6", "neigh", "show", "dev", "tap0"]);
+    assert!(
+        neigh.starts_with("fd76:6d6b:6974::2 lladdr 06:00:ac:1e:00:02 ") && neigh.trim_end().ends_with("PERMANENT"),
+        "{neigh}"
+    );
+}
+
+#[test]
 fn the_vmm_opens_no_connection_through_pasta() {
     if std::env::var_os("VMKIT_TEST_NET").is_none_or(|v| v != "1") {
         assert!(

@@ -404,9 +404,11 @@ pub fn ruleset(spec: &NetSpec, host: &[Cidr]) -> String {
     )
 }
 
-/// `pasta` options, without the namespace to attach to.
+/// `pasta` options, without the namespace to attach to. With `ipv6` (the tap network) pasta
+/// also carries IPv6; `--config-net` sets `egress0`'s addresses and routes, so pasta's router
+/// advertisements and DHCPv6 are off. Without it (a bare namespace) pasta is IPv4-only.
 #[doc(hidden)]
-pub fn pasta_args(spec: &NetSpec) -> Vec<String> {
+pub fn pasta_args(spec: &NetSpec, ipv6: bool) -> Vec<String> {
     // One `--tcp-ports ADDRESS/PORT` per forward: pasta binds each to its own address.
     let ports = |flag: &str, p: Protocol| {
         let list: Vec<String> = spec
@@ -426,7 +428,6 @@ pub fn pasta_args(spec: &NetSpec) -> Vec<String> {
         "--config-net",
         "--ns-ifname",
         EGRESS,
-        "--ipv4-only",
         // Host loopback services stay unreachable from the namespace.
         "--no-map-gw",
         "--tcp-ns",
@@ -439,6 +440,11 @@ pub fn pasta_args(spec: &NetSpec) -> Vec<String> {
     ]
     .map(String::from)
     .to_vec();
+    if ipv6 {
+        args.extend(["--no-ra", "--no-dhcpv6"].map(String::from));
+    } else {
+        args.push("--ipv4-only".into());
+    }
     args.extend(ports("--tcp-ports", Protocol::Tcp));
     args.extend(ports("--udp-ports", Protocol::Udp));
     args
@@ -811,17 +817,33 @@ mod tests {
             r.contains("iifname != \"tap0\" fib daddr type local tcp dport 8443 dnat ip to 172.30.0.2:443"),
             "{r}"
         );
-        let args = pasta_args(&spec);
+        let args = pasta_args(&spec, true);
         let all =
             |flag: &str| -> Vec<String> { args.windows(2).filter(|w| w[0] == flag).map(|w| w[1].clone()).collect() };
         // One spec per forward, each bound to its own address.
         assert_eq!(all("--tcp-ports"), ["127.0.0.1/8080", "192.168.5.15/8443"]);
         assert_eq!(all("--udp-ports"), ["0.0.0.0/5353"]);
         assert_eq!(all("--tcp-ns"), ["none"]);
-        let none = pasta_args(&NetSpec::default());
+        let none = pasta_args(&NetSpec::default(), true);
         let flags = |flag: &str| -> Vec<&String> { none.windows(2).filter(|w| w[0] == flag).map(|w| &w[1]).collect() };
         assert_eq!(flags("--tcp-ports"), ["none"]);
         assert_eq!(flags("--udp-ports"), ["none"]);
+    }
+
+    #[test]
+    fn pasta_is_dual_stack_for_the_tap_network_only() {
+        let tap = pasta_args(&NetSpec::default(), true);
+        assert!(!tap.contains(&"--ipv4-only".to_string()), "{tap:?}");
+        assert!(
+            tap.contains(&"--no-ra".to_string()) && tap.contains(&"--no-dhcpv6".to_string()),
+            "{tap:?}"
+        );
+        let bare = pasta_args(&NetSpec::default(), false);
+        assert!(bare.contains(&"--ipv4-only".to_string()), "{bare:?}");
+        assert!(!bare.contains(&"--no-ra".to_string()), "{bare:?}");
+        for args in [&tap, &bare] {
+            assert!(args.contains(&"--no-map-gw".to_string()), "{args:?}");
+        }
     }
 
     #[test]

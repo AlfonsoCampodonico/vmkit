@@ -552,7 +552,7 @@ pub(crate) fn vmm_spec(spec: &VmSpec, vmm: &Path, args: &[String], extra: &[Moun
 /// The policy half of a network plan: the ruleset for the host's current addresses and IPv6
 /// prefixes. An `allow` entry that is only an address pasta copies is refused
 /// ([`NetSpec::check_allow`]).
-fn policy(n: &NetSpec, ruleset: fn(&NetSpec, &[Cidr]) -> String) -> Result<Policy> {
+fn policy(n: &NetSpec, ruleset: fn(&NetSpec, &[Cidr]) -> String, ipv6: bool) -> Result<Policy> {
     let copied: Vec<IpAddr> = (net::outbound_address().map(IpAddr::V4).into_iter())
         .chain(net::outbound_address6().map(IpAddr::V6))
         .collect();
@@ -571,7 +571,7 @@ fn policy(n: &NetSpec, ruleset: fn(&NetSpec, &[Cidr]) -> String) -> Result<Polic
         nft: binary::find_system("nft")?,
         ruleset: ruleset(n, &host),
         pasta: binary::find("pasta", "VMKIT_PASTA")?,
-        pasta_args: net::pasta_args(n),
+        pasta_args: net::pasta_args(n, ipv6),
     })
 }
 
@@ -581,8 +581,8 @@ fn net_plan(spec: &Spec) -> Result<Option<NetPlan>> {
         // The VMM sandbox keeps loopback down (and needs no `ip`).
         Network::None if spec.root == Root::Empty => return Ok(None),
         Network::None => NetKind::Loopback,
-        Network::Tap(n) => NetKind::Tap(policy(n, net::ruleset)?),
-        Network::Egress(n) => NetKind::Egress(policy(n, net::egress_ruleset)?),
+        Network::Tap(n) => NetKind::Tap(policy(n, net::ruleset, true)?),
+        Network::Egress(n) => NetKind::Egress(policy(n, net::egress_ruleset, false)?),
     };
     Ok(Some(NetPlan {
         ip: binary::find_system("ip")?,
