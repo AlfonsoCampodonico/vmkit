@@ -71,6 +71,7 @@ impl Case {
             memory_mib: 256,
             vsock: None,
             net: None,
+            tap: None,
             console_log: self.dir.path().join("console.log"),
             run_dir: self.dir.path().to_path_buf(),
         }

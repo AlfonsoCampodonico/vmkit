@@ -167,7 +167,7 @@ fn landlock_rules(spec: &VmSpec) -> Vec<Value> {
         rules.push(rule(&sandbox::disk(n), if d.read_only { "r" } else { "rw" }));
     }
     rules.push(rule(sandbox::SOCK, "rw"));
-    if spec.net.is_some() {
+    if spec.has_nic() {
         rules.push(rule(sandbox::TUN, "rw"));
     }
     rules
@@ -323,11 +323,21 @@ impl ChVm {
             config["vsock"] = json!({"cid": v.guest_cid, "socket": sandbox::inside("vsock.sock")});
             self.vsock = Some(socket);
         }
-        if spec.net.is_some() {
-            config["net"] = json!([{"tap": net::TAP, "mac": net::GUEST_MAC}]);
+        if let Some(nic) = net_config(spec) {
+            config["net"] = nic;
         }
         self.call("vm.create", Some(config))
     }
+}
+
+/// The `vm.create` NIC: vmkit's own tap in the VM's namespace, or the caller's attached one.
+fn net_config(spec: &VmSpec) -> Option<serde_json::Value> {
+    let (tap, mac) = match (&spec.net, &spec.tap) {
+        (Some(_), _) => (net::TAP, net::GUEST_MAC),
+        (None, Some(t)) => (t.tap.as_str(), t.mac.as_str()),
+        (None, None) => return None,
+    };
+    Some(json!([{"tap": tap, "mac": mac}]))
 }
 
 /// One entry of the `vm.create` disks. vmkit only supports raw images, so say so: left to
@@ -362,6 +372,7 @@ impl Vm for ChVm {
     }
 
     fn snapshot(&mut self, dest: &Path) -> Result<SnapshotBundle> {
+        self.shape.check_snapshot()?;
         bundle::prepare_dest(dest)?;
         // Pausing a paused VM is an error in Cloud Hypervisor; a VM is paused before every
         // snapshot here, so a failure that leaves it paused is not one.
@@ -415,6 +426,7 @@ mod tests {
             memory_mib: 128,
             vsock: None,
             net: None,
+            tap: None,
             console_log: "/run/vm/console.log".into(),
             run_dir: "/run/vm".into(),
         }
@@ -459,6 +471,21 @@ mod tests {
     fn landlock_allows_the_tun_device_when_there_is_a_nic() {
         let mut s = spec();
         s.net = Some(NetSpec::default());
+        assert!(rules(&s).contains(&("/dev/net/tun".into(), "rw".into())));
+    }
+
+    #[test]
+    fn the_nic_is_vmkits_tap_or_the_attached_one() {
+        let mut s = spec();
+        assert_eq!(net_config(&s), None);
+        s.net = Some(NetSpec::default());
+        assert_eq!(net_config(&s), Some(json!([{"tap": "tap0", "mac": "06:00:ac:1e:00:02"}])));
+        s.net = None;
+        s.tap = Some(crate::net::TapAttach {
+            tap: "kiln0".into(),
+            mac: "0a:58:0a:f4:01:05".into(),
+        });
+        assert_eq!(net_config(&s), Some(json!([{"tap": "kiln0", "mac": "0a:58:0a:f4:01:05"}])));
         assert!(rules(&s).contains(&("/dev/net/tun".into(), "rw".into())));
     }
 }

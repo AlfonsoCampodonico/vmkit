@@ -46,6 +46,9 @@ pub(crate) struct Shape {
     pub memory_mib: u32,
     pub vsock: Option<VsockSpec>,
     pub net: bool,
+    /// The VM's NIC is on its caller's tap ([`crate::TapAttach`]), which a bundle cannot
+    /// record: such a VM is never snapshotted.
+    pub attached: bool,
     /// The host files behind the VM's disks, in order.
     pub disks: Vec<Disk>,
     pub run_dir: PathBuf,
@@ -62,6 +65,7 @@ impl Shape {
             memory_mib: spec.memory_mib,
             vsock: spec.vsock,
             net: spec.net.is_some(),
+            attached: spec.tap.is_some(),
             disks: spec.disks.clone(),
             run_dir: spec.run_dir.clone(),
         }
@@ -105,6 +109,14 @@ impl Shape {
             disks,
             files,
         })
+    }
+
+    /// Refuses a snapshot this shape cannot be restored from.
+    pub fn check_snapshot(&self) -> Result<()> {
+        if self.attached {
+            return Err(Error::Unsupported("a snapshot of a VM on an attached tap"));
+        }
+        Ok(())
     }
 
     /// The host side of [`VMM_DIR`], emptied for a new snapshot; returns the directory's
@@ -331,6 +343,8 @@ impl Restore {
             memory_mib: info.memory_mib,
             vsock: info.vsock_spec(),
             net: rs.net.clone(),
+            // A bundle never holds a VM on an attached tap (Shape::check_snapshot).
+            tap: None,
             console_log: rs.console_log.clone(),
             run_dir: rs.run_dir.clone(),
         };
@@ -584,10 +598,22 @@ mod tests {
             memory_mib: 64,
             vsock: None,
             net: false,
+            attached: false,
             disks: Vec::new(),
             run_dir: run.to_path_buf(),
             lazy: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_vm_on_an_attached_tap_is_never_snapshotted() {
+        let run = tempfile::tempdir().unwrap();
+        assert!(shape(run.path()).check_snapshot().is_ok());
+        let attached = Shape {
+            attached: true,
+            ..shape(run.path())
+        };
+        assert!(matches!(attached.check_snapshot(), Err(Error::Unsupported(_))));
     }
 
     #[test]

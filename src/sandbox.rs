@@ -146,6 +146,9 @@ pub enum Network {
     /// No tap: `pasta` egress for the namespace's own processes under the same deny and allow
     /// sets (potter spec §9.5). Forwards are refused. DNS is answered at [`net::NAMESERVER`].
     Egress(NetSpec),
+    /// No namespace of its own: the program stays in the caller's network namespace, where
+    /// the caller already made the tap it uses ([`net::TapAttach`]). Nothing is set up.
+    Attached,
 }
 
 /// A systemd user scope's limits (used when [`cgroups_available`]).
@@ -281,7 +284,7 @@ impl Spec {
                 return Err("egress without a tap cannot forward ports".into());
             }
             Network::Tap(n) | Network::Egress(n) => n.check()?,
-            Network::None => {}
+            Network::None | Network::Attached => {}
         }
         Ok(())
     }
@@ -484,7 +487,7 @@ fn binds(spec: &VmSpec) -> Vec<Mount> {
         bind(Path::new("/dev/null"), "/dev/null", true),
         bind(Path::new("/dev/urandom"), "/dev/urandom", false),
     ];
-    if spec.net.is_some() {
+    if spec.has_nic() {
         binds.push(bind(Path::new(TUN), TUN, true));
     }
     binds.push(bind(&spec.kernel, KERNEL, false));
@@ -540,7 +543,11 @@ pub(crate) fn vmm_spec(spec: &VmSpec, vmm: &Path, args: &[String], extra: &[Moun
         root: Root::Empty,
         mounts,
         ids: Ids::Caller,
-        network: spec.net.clone().map_or(Network::None, Network::Tap),
+        network: match (&spec.net, &spec.tap) {
+            (Some(n), _) => Network::Tap(n.clone()),
+            (None, Some(_)) => Network::Attached,
+            (None, None) => Network::None,
+        },
         nest: false,
         seccomp: false,
         limits: Limits {
@@ -595,6 +602,8 @@ fn net_plan(spec: &Spec) -> Result<Option<NetPlan>> {
     let kind = match &spec.network {
         // The VMM sandbox keeps loopback down (and needs no `ip`).
         Network::None if spec.root == Root::Empty => return Ok(None),
+        // The caller's namespace, as the caller set it up.
+        Network::Attached => return Ok(None),
         Network::None => NetKind::Loopback,
         Network::Tap(n) => NetKind::Tap(policy(n, net::ruleset, true)?),
         Network::Egress(n) => NetKind::Egress(policy(n, net::egress_ruleset, false)?),
@@ -734,6 +743,7 @@ mod tests {
             memory_mib: 512,
             vsock: None,
             net: None,
+            tap: None,
             console_log: "/run/vm/console.log".into(),
             run_dir: "/run/vm".into(),
         }
@@ -982,6 +992,20 @@ mod tests {
         let expected: Vec<(String, String, bool)> =
             expected.into_iter().map(|(s, d, w)| (s.into(), d.into(), w)).collect();
         assert_eq!(t, expected);
+    }
+
+    #[test]
+    fn an_attached_tap_keeps_the_callers_namespace_and_binds_the_tun_device() {
+        let mut s = spec();
+        s.tap = Some(net::TapAttach {
+            tap: "kiln0".into(),
+            mac: "02:00:0a:00:00:05".into(),
+        });
+        let sandbox = vmm_spec(&s, Path::new("/bin/vmm"), &[], &[]);
+        assert_eq!(sandbox.network, Network::Attached);
+        assert!(targets(&sandbox.mounts).contains(&(TUN.into(), TUN.into(), true)));
+        assert_eq!(sandbox.check(), Ok(()));
+        assert_eq!(net_plan(&sandbox).unwrap(), None, "the helper sets nothing up");
     }
 
     #[test]

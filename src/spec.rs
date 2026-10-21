@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::net::NetSpec;
+use crate::net::{NetSpec, TapAttach};
 
 /// One block device, in boot order (`vda`, `vdb`, ...).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +32,9 @@ pub struct VmSpec {
     pub vsock: Option<VsockSpec>,
     /// A NIC in the VM's own network namespace (kiln spec §9.3).
     pub net: Option<NetSpec>,
+    /// A NIC on a tap the caller made in its own network namespace, where the VMM then
+    /// stays ([`TapAttach`]). A VM has `net` or `tap`, not both.
+    pub tap: Option<TapAttach>,
     /// Guest serial output is appended here. It is opened (create, append) in the caller's
     /// process before the VMM starts, so it may be a FIFO the caller reads.
     pub console_log: PathBuf,
@@ -152,7 +155,12 @@ impl std::fmt::Debug for RestoreSpec {
 impl VmSpec {
     /// The virtio devices this VM needs: its disks, vsock and network.
     pub fn devices_needed(&self) -> u32 {
-        self.disks.len() as u32 + u32::from(self.vsock.is_some()) + u32::from(self.net.is_some())
+        self.disks.len() as u32 + u32::from(self.vsock.is_some()) + u32::from(self.has_nic())
+    }
+
+    /// The VM has a network interface (its own network, or an attached tap).
+    pub fn has_nic(&self) -> bool {
+        self.net.is_some() || self.tap.is_some()
     }
 
     /// Rejects a spec the backend cannot run; drivers call this before starting anything.
@@ -200,6 +208,14 @@ impl VmSpec {
         if let Some(n) = &self.net {
             n.check().map_err(crate::Error::InvalidSpec)?;
         }
+        if let Some(t) = &self.tap {
+            if self.net.is_some() {
+                return Err(crate::Error::InvalidSpec(
+                    "a VM has either a network or an attached tap, not both".into(),
+                ));
+            }
+            t.check().map_err(crate::Error::InvalidSpec)?;
+        }
         Ok(())
     }
 }
@@ -228,6 +244,7 @@ mod tests {
             memory_mib: 128,
             vsock: Some(VsockSpec { guest_cid: 3 }),
             net: None,
+            tap: None,
             console_log: "c".into(),
             run_dir: here(),
         }
@@ -315,6 +332,34 @@ mod tests {
             ..NetSpec::default()
         });
         assert!(matches!(s.check(&CAPS), Err(crate::Error::InvalidSpec(m)) if m.contains("8080")));
+    }
+
+    fn kiln0() -> TapAttach {
+        TapAttach {
+            tap: "kiln0".into(),
+            mac: "02:00:0a:00:00:05".into(),
+        }
+    }
+
+    #[test]
+    fn an_attached_tap_is_one_device_and_excludes_a_network() {
+        let mut s = spec(29);
+        s.tap = Some(kiln0());
+        assert_eq!(s.devices_needed(), 31, "29 disks + vsock + the tap");
+        assert!(matches!(s.check(&CAPS), Err(crate::Error::TooManyDevices { requested: 31, .. })));
+        let mut s = spec(1);
+        s.tap = Some(kiln0());
+        assert!(s.check(&CAPS).is_ok());
+        s.net = Some(NetSpec::default());
+        assert!(
+            matches!(s.check(&CAPS), Err(crate::Error::InvalidSpec(m)) if m.contains("either a network or an attached tap"))
+        );
+        s.net = None;
+        s.tap = Some(TapAttach {
+            mac: "ff:ff:ff:ff:ff:ff".into(),
+            ..kiln0()
+        });
+        assert!(matches!(s.check(&CAPS), Err(crate::Error::InvalidSpec(m)) if m.contains("MAC")));
     }
 
     #[test]
