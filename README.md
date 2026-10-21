@@ -26,7 +26,7 @@ Version 0.1.0. Not published to crates.io; consumers depend on it by git revisio
 | Firecracker backend: create, start, pause, resume, kill, wait | Works | Firecracker 1.17.0 or later. Contract, network and pause suites on x86_64 (CI) and aarch64 (Lima). |
 | Cloud Hypervisor backend: same operations | Works | Cloud Hypervisor 53.0 or later. On aarch64 under nested virtualization, a guest can stay stuck after `resume` while other VMs load the host; see [Tests](#tests). |
 | Disks, vsock, one NIC per VM | Works | Raw disk images only. vsock uses each VMM's Unix-socket scheme; guest-initiated connections are tested. |
-| Guest networking (tap, nftables policy, `pasta` egress, port forwards) | Works | IPv4 only; IPv6 from the guest is dropped. |
+| Guest networking (tap, nftables policy, `pasta` egress, port forwards) | Works | IPv4 egress, and IPv6 egress with `NetSpec::ipv6` (NAT'd behind a ULA); port forwards are IPv4 only. |
 | VMM sandbox (`vmkit-sandbox`) | Works | Linux only. Refuses to run as root. |
 | General program sandbox (`vmkit::sandbox::spawn`) | Works | Linux 5.12 or later; subordinate ids need `newuidmap`/`newgidmap`. |
 | cgroup limits | Works when available | Only with a systemd user session that can create scopes (`vmkit::cgroups_available()`). Otherwise skipped. |
@@ -211,12 +211,12 @@ One namespace per VM: the guest's traffic is policed by nftables and leaves thro
 ```mermaid
 flowchart LR
     subgraph guest["Guest VM"]
-        eth0["eth0 172.30.0.2/30"]
+        eth0["eth0 172.30.0.2/30<br/>fd76:6d6b:6974::2/64"]
     end
 
     subgraph ns["VM network namespace (one per VM)"]
-        tap["tap0 172.30.0.1<br/>gateway and DNS"]
-        fwd{"nftables forward chain<br/>1. drop IPv6 and spoofed sources<br/>2. accept established and DNAT<br/>3. accept allow set<br/>4. drop deny set<br/>5. accept the rest"}
+        tap["tap0 172.30.0.1, fd76:6d6b:6974::1<br/>gateway and DNS (IPv4)"]
+        fwd{"nftables forward chain<br/>1. drop spoofed sources<br/>2. accept established and DNAT<br/>3. accept allow sets<br/>4. drop deny sets<br/>5. accept the rest"}
         dns["DNS: DNAT to 169.254.1.53"]
         egress0["egress0 (pasta)"]
         vmmproc["VMM process"]
@@ -244,13 +244,17 @@ flowchart LR
 
 | `Egress` | Deny set | `allow` |
 |---|---|---|
-| `Restricted` (default) | `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16` (link-local, cloud metadata), `172.16.0.0/12`, `192.0.0.0/24`, `192.168.0.0/16`, `198.18.0.0/15`, `224.0.0.0/3`, and every host address present when the VM is created | exceptions, checked before the deny set |
-| `DenyAll` | `0.0.0.0/0`; DNS still works | exceptions |
+| `Restricted` (default) | `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16` (link-local, cloud metadata), `172.16.0.0/12`, `192.0.0.0/24`, `192.168.0.0/16`, `198.18.0.0/15`, `224.0.0.0/3`, and every host address present when the VM is created; for IPv6, everything outside global unicast (`::/3`, `4000::/2`, `8000::/1`: loopback, IPv4-mapped, NAT64, ULA such as `fd00:ec2::254`, link-local, site-local, multicast), `2001::/23` (Teredo), `2001:db8::/32` and `3fff::/20` (documentation), `2002::/16` (6to4), and the host's IPv6 addresses and every prefix it reaches without a gateway (`/proc/net/ipv6_route`), each widened to its `/56` (the usual end-site allocation, so a cloud VPC's or a home's other subnets are denied as RFC 1918 ones are), when the VM is created | exceptions, IPv4 or IPv6 (`Cidr`), checked before the deny sets |
+| `DenyAll` | `0.0.0.0/0` and `::/0`; DNS still works | exceptions |
 | `Open` | nothing (callers should warn) | ignored |
 
-- Guest IPv6 and packets whose source is not `172.30.0.2` are dropped before anything is accepted.
-- `pasta` runs with `--ipv4-only --no-map-gw`, so host loopback services stay unreachable from the namespace.
-- `pasta` gives the namespace the host's outbound address (the one on its default route, `net::outbound_address`), so the guest can never reach that address. An `allow` entry that is exactly that address is refused (`Error::InvalidSpec`, `NetSpec::check_allow`); a wider entry still reaches its other addresses. The host's other addresses are reachable through an `allow` exception.
+- Packets whose source is not `172.30.0.2` or `fd76:6d6b:6974::2` are dropped before anything is accepted.
+- IPv6 is opt-in (`NetSpec::ipv6`, off by default, and ignored on a host without IPv6): without it the guest's IPv6 is dropped and the namespace has no IPv6 side, as before. With it the guest's IPv6 is NAT66: `fd76:6d6b:6974::2/64` (gateway `::1`, `net::GUEST6`, `net::GATEWAY6`) is masqueraded like its IPv4 address. Neighbour discovery stays on the host side:
+  - the tap takes no router advertisement or redirect;
+  - the guest's neighbour entry is permanent, never learned from the guest;
+  - of ICMPv6 from the guest, only neighbour solicitations from its own address reach the namespace, and a guard at prerouting drops packets to any other address on the tap's link, which the namespace would otherwise route back to the tap (creating a neighbour entry for each). Both bound the host's shared neighbour table.
+- `pasta` runs with `--no-map-gw`, so host loopback services stay unreachable from the namespace, and with `--ipv4-only`, or with `--no-ra --no-dhcpv6` (dual-stack) when the tap network has IPv6. On a host with IPv6 but no IPv6 default route the guest's IPv6 connections fail at `pasta`. `Network::Egress` is always IPv4-only.
+- `pasta` gives the namespace the host's outbound addresses (the one on its IPv4 default route, `net::outbound_address`, and with IPv6 the global addresses of the interface on its IPv6 default route, `net::outbound_addresses6`), so the guest can never reach them. An `allow` entry that is exactly one of them is refused (`Error::InvalidSpec`, `NetSpec::check_allow`); a wider entry still reaches its other addresses. The host's other addresses are reachable through an `allow` exception.
 - Each `PortForward { protocol, address, host, guest }` names the host address `pasta` listens on (`127.0.0.1` keeps it to this host, `0.0.0.0` listens on every address). A host port can be forwarded once per protocol, whatever its addresses, because the namespace sees only the port. Ports below 1024 cannot be forwarded by an unprivileged `pasta` unless the host lowers `net.ipv4.ip_unprivileged_port_start`; creating the VM then fails with `pasta`'s message.
 - The guest kernel is built without netfilter: the policy lives outside the VM.
 
@@ -453,7 +457,7 @@ Hosted arm64 runners have no KVM, so the aarch64 kernel is boot-tested by hand a
 | `tests/sandbox.rs` | Linux, `VMKIT_SANDBOX`; no KVM (busybox stands in for the VMM) | root contents, read-only binds, exit mirroring, no privileges, inherited descriptors, symlinks, no user namespaces, session keyring; network checks with `VMKIT_TEST_NET=1` |
 | `tests/exec.rs` | Linux, `VMKIT_SANDBOX`, `uidmap`, a subuid range, `/usr/bin/busybox`; no KVM | ids, roots, overlay whiteouts and xattrs, nesting, env and cwd, seccomp; egress with `VMKIT_TEST_NET=1` |
 | `tests/contract.rs` | KVM, both VMMs, `VMKIT_TEST_KERNEL`, `VMKIT_TEST_INITRAMFS` | on both backends: boot and exit method, reset backstop, panic, kill, disk order, writes to sector 0, device budget, guest-initiated vsock, symlinked disks refused, a run directory with a comma, the sandbox's contents and privileges |
-| `tests/network.rs` | as contract, plus `testguest/net-fixture.sh` and `VMKIT_TEST_NET=1` | the hostile guest: metadata, private and host addresses, the gateway, other VMs and spoofed sources are unreachable; allowed destinations, DNS and port forwards work; an `allow` entry for the outbound address is refused; a host port in use fails with `pasta`'s message |
+| `tests/network.rs` | as contract, plus `testguest/net-fixture.sh` and `VMKIT_TEST_NET=1` | the hostile guest, over IPv4 and IPv6: metadata, private and host addresses, the gateway, other VMs and spoofed sources are unreachable; allowed destinations, DNS and port forwards work; an `allow` entry for the outbound address is refused; a host port in use fails with `pasta`'s message |
 | `tests/pause.rs` | as contract | pause stops the guest, resume continues it |
 | `tests/snapshot.rs` | as contract | snapshot and restore (local and lazy) continue the guest with its memory, disk and new vsock connections; a bundle restores twice and is never written; foreign, tampered and lazily corrupted bundles are refused |
 
@@ -463,7 +467,7 @@ Without their variables the Linux suites skip each test; `VMKIT_REQUIRE_KVM_TEST
 cargo test                                   # unit tests, any platform
 cargo build --bin vmkit-sandbox && scripts/install-apparmor.sh "$PWD/target/debug/vmkit-sandbox"
 testguest/build-initramfs.sh out/initramfs.cpio.gz
-testguest/net-fixture.sh                     # fixture addresses on lo for the network tests (sudo, once per boot)
+testguest/net-fixture.sh                     # fixture addresses on lo, and an IPv6 route for pasta if the host has none (sudo, once per boot)
 export VMKIT_SANDBOX=$PWD/target/debug/vmkit-sandbox VMKIT_TEST_NET=1 VMKIT_REQUIRE_KVM_TESTS=1
 export VMKIT_TEST_KERNEL=out/vmlinux-6.18.54-aarch64 VMKIT_TEST_INITRAMFS=out/initramfs.cpio.gz
 cargo test --test sandbox

@@ -14,7 +14,7 @@
 //! `/vm/kernel`, `/vm/initramfs`, `/vm/disk/<n>` and `/vm/sock/`, which is `<run_dir>/sock`
 //! on the host. Its paths never depend on where files live on the host.
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{ChildStderr, ChildStdout, ExitStatus};
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::binary;
 use crate::error::{Error, Result};
-use crate::net::{self, NetSpec};
+use crate::net::{self, Cidr, NetSpec};
 use crate::process::{self, Proc};
 use crate::spec::VmSpec;
 use crate::subid;
@@ -372,6 +372,9 @@ pub struct Policy {
     /// `pasta` and its options; the helper adds the namespace to attach to.
     pub pasta: PathBuf,
     pub pasta_args: Vec<String>,
+    /// Give the tap its IPv6 side (the spec asked for it and the host has IPv6).
+    #[serde(default)]
+    pub ipv6: bool,
 }
 
 /// What the helper sets up in the network namespace.
@@ -549,17 +552,41 @@ pub(crate) fn vmm_spec(spec: &VmSpec, vmm: &Path, args: &[String], extra: &[Moun
     }
 }
 
-/// The policy half of a network plan: the ruleset for the host's current addresses. An
-/// `allow` entry that is only the address pasta copies is refused ([`NetSpec::check_allow`]).
-fn policy(n: &NetSpec, ruleset: fn(&NetSpec, &[Ipv4Addr]) -> String) -> Result<Policy> {
-    n.check_allow(net::outbound_address().as_slice())
-        .map_err(Error::InvalidSpec)?;
-    let host: Vec<Ipv4Addr> = net::host_addresses(&std::fs::read_to_string("/proc/net/fib_trie")?);
+/// The policy half of a network plan: the ruleset for the host's current addresses and IPv6
+/// prefixes. An `allow` entry that is only an address pasta copies is refused
+/// ([`NetSpec::check_allow`]). IPv6 is on only with a tap, when the spec asks for it and the
+/// host has IPv6; otherwise the namespace stays IPv4-only, as it was before IPv6.
+fn policy(n: &NetSpec, ruleset: fn(&NetSpec, &[Cidr]) -> String, tap: bool) -> Result<Policy> {
+    let n = &NetSpec {
+        ipv6: tap && n.ipv6 && net::host_has_ipv6(),
+        ..n.clone()
+    };
+    let copied: Vec<IpAddr> = (net::outbound_address().map(IpAddr::V4).into_iter())
+        .chain(
+            n.ipv6
+                .then(net::outbound_addresses6)
+                .into_iter()
+                .flatten()
+                .map(IpAddr::V6),
+        )
+        .collect();
+    n.check_allow(&copied).map_err(Error::InvalidSpec)?;
+    // A host without IPv6 has no `ipv6_route`.
+    let routes6 = match std::fs::read_to_string("/proc/net/ipv6_route") {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        r => r?,
+    };
+    let host: Vec<Cidr> = net::host_addresses(&std::fs::read_to_string("/proc/net/fib_trie")?)
+        .into_iter()
+        .filter_map(|a| Cidr::new(a, 32))
+        .chain(net::host_prefixes6(&routes6))
+        .collect();
     Ok(Policy {
         nft: binary::find_system("nft")?,
         ruleset: ruleset(n, &host),
         pasta: binary::find("pasta", "VMKIT_PASTA")?,
         pasta_args: net::pasta_args(n),
+        ipv6: n.ipv6,
     })
 }
 
@@ -569,8 +596,8 @@ fn net_plan(spec: &Spec) -> Result<Option<NetPlan>> {
         // The VMM sandbox keeps loopback down (and needs no `ip`).
         Network::None if spec.root == Root::Empty => return Ok(None),
         Network::None => NetKind::Loopback,
-        Network::Tap(n) => NetKind::Tap(policy(n, net::ruleset)?),
-        Network::Egress(n) => NetKind::Egress(policy(n, net::egress_ruleset)?),
+        Network::Tap(n) => NetKind::Tap(policy(n, net::ruleset, true)?),
+        Network::Egress(n) => NetKind::Egress(policy(n, net::egress_ruleset, false)?),
     };
     Ok(Some(NetPlan {
         ip: binary::find_system("ip")?,
@@ -872,7 +899,7 @@ mod tests {
                     s.network = Network::Egress(NetSpec {
                         forwards: vec![net::PortForward {
                             protocol: net::Protocol::Tcp,
-                            address: Ipv4Addr::LOCALHOST,
+                            address: std::net::Ipv4Addr::LOCALHOST,
                             host: 8080,
                             guest: 80,
                         }],
@@ -992,6 +1019,7 @@ mod tests {
                     ruleset: "table inet vmkit {}".into(),
                     pasta: "/bin/pasta".into(),
                     pasta_args: vec!["--quiet".into()],
+                    ipv6: true,
                 }),
             }),
         };

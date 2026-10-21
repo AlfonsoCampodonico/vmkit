@@ -5,23 +5,31 @@
 //!   169.254.169.254  stands in for cloud metadata
 //!   10.250.0.1       a private (RFC 1918) address on the host
 //!   198.51.100.7     a host address outside the private ranges
+//!   fd00:ec2::254    stands in for cloud metadata over IPv6 (AWS's address)
+//!   fd00:250::1      a private (ULA) IPv6 address on the host
+//!   3ffe::7          a host IPv6 address outside the special ranges
+//! and, on a host without IPv6, a stand-in default route for pasta to copy.
 //! Set VMKIT_TEST_NET=1 once they exist; VMKIT_REQUIRE_KVM_TESTS=1 makes skipping a failure.
 
 mod common;
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use common::{Case, END};
-use vmkit::net::{Cidr, Egress, GATEWAY, GUEST, PREFIX, PortForward, Protocol};
+use vmkit::net::{Cidr, Egress, GATEWAY, GATEWAY6, GUEST, GUEST6, PREFIX, PREFIX6, PortForward, Protocol};
 use vmkit::{Backend, NetSpec, Vm, VmSpec};
 
 const METADATA: &str = "169.254.169.254";
 const PRIVATE: &str = "10.250.0.1";
 const HOST: &str = "198.51.100.7";
-/// A source address the guest was not given.
+const METADATA6: &str = "fd00:ec2::254";
+const PRIVATE6: &str = "fd00:250::1";
+const HOST6: &str = "3ffe::7";
+/// Source addresses the guest was not given.
 const SPOOF: &str = "10.200.0.9/32";
+const SPOOF6: &str = "fd76:6d6b:6974::99/64";
 
 fn net_case(backend: Backend) -> Option<Case> {
     if std::env::var_os("VMKIT_TEST_NET").is_none_or(|v| v != "1") {
@@ -34,9 +42,9 @@ fn net_case(backend: Backend) -> Option<Case> {
     Case::new(backend)
 }
 
-/// A host listener on every address that accepts and closes connections.
+/// A host listener on every address, IPv4 and IPv6, that accepts and closes connections.
 fn listener() -> u16 {
-    let l = TcpListener::bind("0.0.0.0:0").unwrap();
+    let l = TcpListener::bind("[::]:0").unwrap();
     let port = l.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for s in l.incoming() {
@@ -56,13 +64,20 @@ fn net_spec(c: &Case, net: NetSpec, extra: &[String]) -> VmSpec {
     let mut spec = c.spec("net");
     spec.cmdline.push(format!("vmkit.ip={GUEST}/{PREFIX}"));
     spec.cmdline.push(format!("vmkit.gw={GATEWAY}"));
+    spec.cmdline.push(format!("vmkit.ip6={GUEST6}/{PREFIX6}"));
+    spec.cmdline.push(format!("vmkit.gw6={GATEWAY6}"));
     spec.cmdline.extend(extra.iter().cloned());
-    spec.net = Some(net);
+    spec.net = Some(NetSpec { ipv6: true, ..net });
     spec
 }
 
+/// `addr:port`, with an IPv6 address in brackets.
+fn at(addr: &str, port: u16) -> String {
+    SocketAddr::new(addr.parse::<IpAddr>().unwrap(), port).to_string()
+}
+
 fn probes(addrs: &[&str], port: u16) -> Vec<String> {
-    addrs.iter().map(|a| format!("vmkit.probe={a}:{port}")).collect()
+    addrs.iter().map(|a| format!("vmkit.probe={}", at(a, port))).collect()
 }
 
 /// The guest's verdict for one probe, e.g. `("tcp", "10.250.0.1:80")` -> `"open"`.
@@ -85,11 +100,13 @@ fn dns(c: &Case, name: &str) -> String {
 fn restricted_egress_reaches_no_metadata_private_or_host_address(backend: Backend) {
     let Some(c) = net_case(backend) else { return };
     let port = listener();
-    let mut extra = probes(&[METADATA, PRIVATE, HOST, &GATEWAY.to_string()], port);
+    let (gateway, gateway6) = (GATEWAY.to_string(), GATEWAY6.to_string());
+    let targets = [METADATA, PRIVATE, HOST, &gateway, METADATA6, PRIVATE6, HOST6, &gateway6];
+    let mut extra = probes(&targets, port);
     extra.push("vmkit.dns=localhost".into());
     c.run(&net_spec(&c, NetSpec::default(), &extra));
-    for target in [METADATA, PRIVATE, HOST, &GATEWAY.to_string()] {
-        assert_eq!(verdict(&c, "tcp", &format!("{target}:{port}")), "closed", "{target}");
+    for target in targets {
+        assert_eq!(verdict(&c, "tcp", &at(target, port)), "closed", "{target}");
     }
     assert_eq!(dns(&c, "localhost"), "ok", "DNS through the gateway");
 }
@@ -98,51 +115,62 @@ fn allowed_destinations_are_reachable_and_spoofed_sources_are_not(backend: Backe
     let Some(c) = net_case(backend) else { return };
     let port = listener();
     let net = NetSpec {
-        allow: vec![format!("{PRIVATE}/32").parse::<Cidr>().unwrap()],
+        allow: vec![PRIVATE.parse::<Cidr>().unwrap(), PRIVATE6.parse::<Cidr>().unwrap()],
         ..NetSpec::default()
     };
-    let mut extra = probes(&[PRIVATE, METADATA], port);
+    let mut extra = probes(&[PRIVATE, METADATA, PRIVATE6, METADATA6], port);
     extra.push(format!("vmkit.spoof={SPOOF}"));
+    extra.push(format!("vmkit.spoof6={SPOOF6}"));
     c.run(&net_spec(&c, net, &extra));
-    // The positive control: the path works, so the other verdicts are the policy's.
-    assert_eq!(verdict(&c, "tcp", &format!("{PRIVATE}:{port}")), "open");
-    assert_eq!(verdict(&c, "tcp", &format!("{METADATA}:{port}")), "closed");
-    assert_eq!(verdict(&c, "spoofed", &format!("{PRIVATE}:{port}")), "closed");
+    // The positive controls: the path works, so the other verdicts are the policy's.
+    for (private, metadata) in [(PRIVATE, METADATA), (PRIVATE6, METADATA6)] {
+        assert_eq!(verdict(&c, "tcp", &at(private, port)), "open", "{private}");
+        assert_eq!(verdict(&c, "tcp", &at(metadata, port)), "closed", "{metadata}");
+        assert_eq!(verdict(&c, "spoofed", &at(private, port)), "closed", "{private}");
+    }
 }
 
 fn deny_all_leaves_only_dns_and_open_removes_the_denies(backend: Backend) {
     let Some(c) = net_case(backend) else { return };
     let port = listener();
-    let mut extra = probes(&[PRIVATE, HOST], port);
+    let mut extra = probes(&[PRIVATE, HOST, PRIVATE6, HOST6], port);
     extra.push("vmkit.dns=localhost".into());
     let deny_all = NetSpec {
         egress: Egress::DenyAll,
         ..NetSpec::default()
     };
     c.run(&net_spec(&c, deny_all, &extra));
-    assert_eq!(verdict(&c, "tcp", &format!("{PRIVATE}:{port}")), "closed");
-    assert_eq!(verdict(&c, "tcp", &format!("{HOST}:{port}")), "closed");
+    for target in [PRIVATE, HOST, PRIVATE6, HOST6] {
+        assert_eq!(verdict(&c, "tcp", &at(target, port)), "closed", "{target}");
+    }
     assert_eq!(dns(&c, "localhost"), "ok");
 
     // Allow exceptions apply under deny-all.
     let Some(c) = net_case(backend) else { return };
     let deny_all_but_private = NetSpec {
         egress: Egress::DenyAll,
-        allow: vec![format!("{PRIVATE}/32").parse::<Cidr>().unwrap()],
+        allow: vec![PRIVATE.parse::<Cidr>().unwrap(), PRIVATE6.parse::<Cidr>().unwrap()],
         ..NetSpec::default()
     };
-    c.run(&net_spec(&c, deny_all_but_private, &probes(&[PRIVATE, HOST], port)));
-    assert_eq!(verdict(&c, "tcp", &format!("{PRIVATE}:{port}")), "open");
-    assert_eq!(verdict(&c, "tcp", &format!("{HOST}:{port}")), "closed");
+    c.run(&net_spec(
+        &c,
+        deny_all_but_private,
+        &probes(&[PRIVATE, HOST, PRIVATE6, HOST6], port),
+    ));
+    for (private, host) in [(PRIVATE, HOST), (PRIVATE6, HOST6)] {
+        assert_eq!(verdict(&c, "tcp", &at(private, port)), "open", "{private}");
+        assert_eq!(verdict(&c, "tcp", &at(host, port)), "closed", "{host}");
+    }
 
     let Some(c) = net_case(backend) else { return };
     let open = NetSpec {
         egress: Egress::Open,
         ..NetSpec::default()
     };
-    c.run(&net_spec(&c, open, &probes(&[HOST, METADATA], port)));
-    assert_eq!(verdict(&c, "tcp", &format!("{HOST}:{port}")), "open");
-    assert_eq!(verdict(&c, "tcp", &format!("{METADATA}:{port}")), "open");
+    c.run(&net_spec(&c, open, &probes(&[HOST, METADATA, HOST6, METADATA6], port)));
+    for target in [HOST, METADATA, HOST6, METADATA6] {
+        assert_eq!(verdict(&c, "tcp", &at(target, port)), "open", "{target}");
+    }
 }
 
 /// An HTTP GET of `/` from `addr`, retried until the guest serves it.

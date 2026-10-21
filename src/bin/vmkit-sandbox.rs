@@ -47,7 +47,7 @@ mod linux {
         CapabilitySet, UnshareFlags, capabilities, clear_ambient_capability_set, configure_capability_in_ambient_set,
         set_capabilities, set_no_new_privs, set_thread_groups, set_thread_res_gid, set_thread_res_uid,
     };
-    use vmkit::net::{GATEWAY, PREFIX, TAP};
+    use vmkit::net::{GATEWAY, GATEWAY6, GUEST_MAC, GUEST6, PREFIX, PREFIX6, TAP};
     use vmkit::sandbox::{Mount, NetKind, NetPlan, Plan, Policy, Program, Root, SubidPlan};
 
     /// The capabilities `init` needs inside the user namespace: mounts and pivot_root,
@@ -376,12 +376,45 @@ mod linux {
             None,
         );
         tool(ip, &["addr", "add", &gateway, "dev", TAP], None);
-        tool(ip, &["link", "set", TAP, "up"], None);
         // Both apply to this namespace only. `route_localnet` lets a forwarded connection that
         // pasta spliced from host loopback leave through the tap after DNAT.
-        let sysctl = |path: &str| fs::write(path, "1").unwrap_or_else(|e| fail(&format!("writing {path}"), e));
-        sysctl("/proc/sys/net/ipv4/ip_forward");
-        sysctl(&format!("/proc/sys/net/ipv4/conf/{TAP}/route_localnet"));
+        let sysctl =
+            |path: &str, value: &str| fs::write(path, value).unwrap_or_else(|e| fail(&format!("writing {path}"), e));
+        sysctl("/proc/sys/net/ipv4/ip_forward", "1");
+        sysctl(&format!("/proc/sys/net/ipv4/conf/{TAP}/route_localnet"), "1");
+        // The tap's IPv6 side, unless the namespace has IPv6 off (a host whose namespaces
+        // inherit `disable_ipv6`): then the guest's IPv6 goes nowhere.
+        let ipv6 = net.ipv6
+            && fs::read_to_string(format!("/proc/sys/net/ipv6/conf/{TAP}/disable_ipv6")).is_ok_and(|v| v.trim() == "0");
+        if ipv6 {
+            // Usable at once: the guest's duplicate address detection never reaches the namespace.
+            let gateway6 = format!("{GATEWAY6}/{PREFIX6}");
+            tool(ip, &["-6", "addr", "add", &gateway6, "dev", TAP, "nodad"], None);
+            // The tap takes no router advertisement or redirect from the guest, even if
+            // forwarding were off.
+            sysctl("/proc/sys/net/ipv6/conf/all/forwarding", "1");
+            sysctl(&format!("/proc/sys/net/ipv6/conf/{TAP}/accept_ra"), "0");
+            sysctl(&format!("/proc/sys/net/ipv6/conf/{TAP}/accept_redirects"), "0");
+        }
+        tool(ip, &["link", "set", TAP, "up"], None);
+        if ipv6 {
+            // The guest's neighbour entry is fixed, never learned from the guest. Bringing the
+            // link up would flush it, the VMM opening the tap does not.
+            let guest6 = GUEST6.to_string();
+            let neigh = [
+                "-6",
+                "neigh",
+                "replace",
+                &guest6,
+                "lladdr",
+                GUEST_MAC,
+                "dev",
+                TAP,
+                "nud",
+                "permanent",
+            ];
+            tool(ip, &neigh, None);
+        }
         tool(&net.nft, &["-f", "-"], Some(&net.ruleset));
     }
 

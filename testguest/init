@@ -3,9 +3,11 @@
 #   vmkit.test=<action>  up | reboot | panic | exit | idle | vsock | disks | sector0 | net | count
 #   vmkit.exit=<method>  poweroff | reboot  (how "up", "vsock", "disks" and "net" end)
 #   vmkit.ip=<addr/len> vmkit.gw=<addr>  configure eth0 (with vmkit.test=net)
-#   vmkit.probe=<ip>:<port>  try a TCP connection (repeatable)
+#   vmkit.ip6=<addr/len> vmkit.gw6=<addr>  and its IPv6 side
+#   vmkit.probe=<ip>:<port>  try a TCP connection (repeatable); an IPv6 <ip> is in brackets
 #   vmkit.dns=<name>         resolve a name through the gateway (repeatable)
-#   vmkit.spoof=<addr/len>   then probe again from this unassigned source address
+#   vmkit.spoof=<addr/len>   then probe the IPv4 targets again from this unassigned source address
+#   vmkit.spoof6=<addr/len>  and the IPv6 targets from this one
 #   vmkit.serve=<port>       serve HTTP on this port ("VMKIT-SERVED"), then wait for vmkit.hold=<seconds>
 #   vmkit.mark=<word>        with vmkit.test=count: written to sector 0 of vda, if there is one
 #   vmkit.vsock=<port>       with vmkit.test=count: try a vsock connection to the host each tick
@@ -14,26 +16,31 @@
 /bin/busybox mount -t devtmpfs dev /dev
 action=up
 method=poweroff
-ip= gw= probes= names= spoof= serve= hold=0 mark=1 vport=
+ip= gw= ip6= gw6= probes= names= spoof= spoof6= serve= hold=0 mark=1 vport=
 for arg in $(/bin/busybox cat /proc/cmdline); do
   case $arg in
     vmkit.test=*) action=${arg#vmkit.test=} ;;
     vmkit.exit=*) method=${arg#vmkit.exit=} ;;
     vmkit.ip=*) ip=${arg#vmkit.ip=} ;;
     vmkit.gw=*) gw=${arg#vmkit.gw=} ;;
+    vmkit.ip6=*) ip6=${arg#vmkit.ip6=} ;;
+    vmkit.gw6=*) gw6=${arg#vmkit.gw6=} ;;
     vmkit.probe=*) probes="$probes ${arg#vmkit.probe=}" ;;
     vmkit.dns=*) names="$names ${arg#vmkit.dns=}" ;;
     vmkit.spoof=*) spoof=${arg#vmkit.spoof=} ;;
+    vmkit.spoof6=*) spoof6=${arg#vmkit.spoof6=} ;;
     vmkit.serve=*) serve=${arg#vmkit.serve=} ;;
     vmkit.hold=*) hold=${arg#vmkit.hold=} ;;
     vmkit.mark=*) mark=${arg#vmkit.mark=} ;;
     vmkit.vsock=*) vport=${arg#vmkit.vsock=} ;;
   esac
 done
-probe() { # probe <label> <ip:port>
-  if /bin/busybox nc -w 3 "${2%:*}" "${2##*:}" </dev/null >/dev/null 2>&1; then r=open; else r=closed; fi
+probe() { # probe <label> <ip:port>|<[ipv6]:port>
+  host=${2%:*}; host=${host#[}; host=${host%]}
+  if /bin/busybox nc -w 3 "$host" "${2##*:}" </dev/null >/dev/null 2>&1; then r=open; else r=closed; fi
   echo "VMKIT-PROBE $1 $2 $r"
 }
+is6() { case $1 in \[*) return 0 ;; *) return 1 ;; esac; }
 end() {
   case $method in
     reboot) /bin/busybox reboot -f ;;
@@ -61,6 +68,12 @@ case $action in
     /bin/busybox ip addr add "$ip" dev eth0
     /bin/busybox ip link set eth0 up
     /bin/busybox ip route add default via "$gw"
+    if [ -n "$ip6" ]; then
+      # No duplicate address detection, so the address is usable at once.
+      echo 0 > /proc/sys/net/ipv6/conf/eth0/accept_dad
+      /bin/busybox ip -6 addr add "$ip6" dev eth0
+      /bin/busybox ip -6 route add default via "$gw6" dev eth0
+    fi
     echo "VMKIT-NET-CONFIGURED"
     if [ -n "$serve" ]; then
       /bin/busybox mkdir -p /srv && echo VMKIT-SERVED > /srv/index.html
@@ -75,7 +88,12 @@ case $action in
       # Send from an address the host did not assign (the route's preferred source).
       /bin/busybox ip addr add "$spoof" dev eth0
       /bin/busybox ip route replace default via "$gw" src "${spoof%/*}"
-      for p in $probes; do probe spoofed "$p"; done
+      for p in $probes; do is6 "$p" || probe spoofed "$p"; done
+    fi
+    if [ -n "$spoof6" ]; then
+      /bin/busybox ip -6 addr add "$spoof6" dev eth0
+      /bin/busybox ip -6 route replace default via "$gw6" dev eth0 src "${spoof6%/*}"
+      for p in $probes; do is6 "$p" && probe spoofed "$p"; done
     fi
     /bin/busybox sleep "$hold"
     end ;;
