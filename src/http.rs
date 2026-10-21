@@ -20,20 +20,42 @@ pub(crate) struct Response {
     pub body: String,
 }
 
-/// Sends one request with an optional JSON body and reads the response. A socket failure
-/// (including the VMM closing the connection) is `Error::Io`; an answer that is not valid
-/// HTTP is `Error::Http`.
-pub(crate) fn request(socket: &Path, method: &str, path: &str, body: Option<&serde_json::Value>) -> Result<Response> {
-    exchange(socket, method, path, body).map_err(|e| match e.kind() {
+/// How long an ordinary request may take. Calls that move guest memory (snapshot and
+/// restore) take as long as copying it does, and longer under nested virtualization, so
+/// they pass their own timeout.
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+fn request(socket: &Path, method: &str, path: &str, body: Option<&serde_json::Value>) -> Result<Response> {
+    request_timeout(socket, method, path, body, TIMEOUT)
+}
+
+/// Sends one request with an optional JSON body and reads the response, giving up after
+/// `timeout`. A socket failure (including the VMM closing the connection) is `Error::Io`; an
+/// answer that is not valid HTTP is `Error::Http`.
+pub(crate) fn request_timeout(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+    timeout: Duration,
+) -> Result<Response> {
+    exchange(socket, method, path, body, timeout).map_err(|e| match e.kind() {
         io::ErrorKind::InvalidData => Error::Http(e.to_string()),
         _ => Error::Io(e),
     })
 }
 
-fn exchange(socket: &Path, method: &str, path: &str, body: Option<&serde_json::Value>) -> io::Result<Response> {
+fn exchange(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+    timeout: Duration,
+) -> io::Result<Response> {
     let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     let body = body.map(|b| b.to_string()).unwrap_or_default();
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n");
     if !body.is_empty() {

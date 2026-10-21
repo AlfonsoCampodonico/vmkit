@@ -97,13 +97,31 @@ pub enum Mount {
         target: PathBuf,
         size_mib: u32,
     },
+    /// A FUSE filesystem served from outside the sandbox (lazy restore): the helper opens
+    /// `/dev/fuse`, mounts it on `target` for the caller's ids only, and sends the descriptor
+    /// over the Unix socket `socket`, a host path the program never sees. Mounts after this
+    /// one may read the filesystem, so its server must be answering by then.
+    Fuse {
+        target: PathBuf,
+        socket: PathBuf,
+    },
+    /// A bind of `source`, a path inside the root under an earlier [`Mount::Fuse`] target, onto
+    /// `target` (stacked on whatever is mounted there already).
+    Rebind {
+        source: PathBuf,
+        target: PathBuf,
+        writable: bool,
+    },
 }
 
 impl Mount {
     /// Where the mount appears inside the root.
     pub fn target(&self) -> &Path {
         match self {
-            Mount::Bind { target, .. } | Mount::Tmpfs { target, .. } => target,
+            Mount::Bind { target, .. }
+            | Mount::Tmpfs { target, .. }
+            | Mount::Fuse { target, .. }
+            | Mount::Rebind { target, .. } => target,
         }
     }
 }
@@ -188,8 +206,27 @@ impl Spec {
     pub fn check(&self) -> std::result::Result<(), String> {
         let c = &self.command;
         require_plain("the working directory", &c.cwd)?;
+        let mut fuse: Option<&Path> = None;
         for m in &self.mounts {
             require_plain("the mount target", m.target())?;
+            match m {
+                Mount::Fuse { target, socket } => {
+                    require_plain("the FUSE socket", socket)?;
+                    if fuse.replace(target).is_some() {
+                        return Err("a sandbox has at most one FUSE mount".into());
+                    }
+                }
+                Mount::Rebind { source, .. } => {
+                    require_plain("the rebind source", source)?;
+                    if !fuse.is_some_and(|f| source.starts_with(f) && source != f) {
+                        return Err(format!(
+                            "the rebind source {} must lie under an earlier FUSE mount",
+                            source.display()
+                        ));
+                    }
+                }
+                Mount::Bind { .. } | Mount::Tmpfs { .. } => {}
+            }
         }
         match (&c.program, &self.root) {
             (Program::Bound { target, .. }, Root::Empty) => require_plain("the program's target", target)?,
@@ -376,6 +413,8 @@ pub(crate) const KERNEL: &str = "/vm/kernel";
 pub(crate) const INITRAMFS: &str = "/vm/initramfs";
 /// The VMM's own directory inside the sandbox: sockets and the logs it writes itself.
 pub(crate) const SOCK: &str = "/vm/sock";
+/// A restored VM's snapshot files, inside the sandbox.
+pub(crate) const SNAPSHOT: &str = "/vm/snapshot";
 /// The tap's device, inside the sandbox.
 pub(crate) const TUN: &str = "/dev/net/tun";
 
@@ -478,8 +517,11 @@ fn scope_properties(c: &Cgroup) -> Vec<String> {
     ]
 }
 
-/// The sandbox a VMM runs in: an empty root, the caller's own ids, the VMM bound at `/vmm`.
-pub(crate) fn vmm_spec(spec: &VmSpec, vmm: &Path, args: &[String]) -> Spec {
+/// The sandbox a VMM runs in: an empty root, the caller's own ids, the VMM bound at `/vmm`,
+/// and `extra` mounts after the VM's own (a restore's snapshot files).
+pub(crate) fn vmm_spec(spec: &VmSpec, vmm: &Path, args: &[String], extra: &[Mount]) -> Spec {
+    let mut mounts = binds(spec);
+    mounts.extend_from_slice(extra);
     Spec {
         command: Command {
             program: Program::Bound {
@@ -493,7 +535,7 @@ pub(crate) fn vmm_spec(spec: &VmSpec, vmm: &Path, args: &[String]) -> Spec {
             user: None,
         },
         root: Root::Empty,
-        mounts: binds(spec),
+        mounts,
         ids: Ids::Caller,
         network: spec.net.clone().map_or(Network::None, Network::Tap),
         nest: false,
@@ -626,8 +668,15 @@ pub fn spawn(spec: &Spec, stdio: Stdio) -> Result<Sandbox> {
 
 /// Starts `vmm` with in-sandbox `args` under the sandbox `helper` for `spec`. Guest serial is
 /// appended to `spec.console_log`; the VMM's and the helper's stderr go to `stderr_log`.
-pub(crate) fn spawn_vmm(helper: &Path, vmm: &Path, args: &[String], spec: &VmSpec, stderr_log: &Path) -> Result<Proc> {
-    let sandbox = vmm_spec(spec, vmm, args);
+pub(crate) fn spawn_vmm(
+    helper: &Path,
+    vmm: &Path,
+    args: &[String],
+    spec: &VmSpec,
+    stderr_log: &Path,
+    extra: &[Mount],
+) -> Result<Proc> {
+    let sandbox = vmm_spec(spec, vmm, args, extra);
     let plan = plan(&sandbox)?;
     let path = write_plan(&plan)?;
     let (program, args) = launcher(helper, &path, sandbox.limits.cgroup.as_ref());
@@ -672,7 +721,7 @@ mod tests {
                     target,
                     writable,
                 } => (source.display().to_string(), target.display().to_string(), *writable),
-                Mount::Tmpfs { .. } => panic!("the VMM gets no tmpfs"),
+                other => panic!("the VMM gets only binds here: {other:?}"),
             })
             .collect()
     }
@@ -709,6 +758,17 @@ mod tests {
     #[test]
     fn a_well_formed_spec_passes() {
         assert_eq!(exec_spec().check(), Ok(()));
+        let mut s = exec_spec();
+        s.mounts.push(Mount::Fuse {
+            target: "/lazy".into(),
+            socket: "/run/s/lazy.sock".into(),
+        });
+        s.mounts.push(Mount::Rebind {
+            source: "/lazy/memory".into(),
+            target: "/vm/memory".into(),
+            writable: false,
+        });
+        assert_eq!(s.check(), Ok(()));
     }
 
     #[test]
@@ -727,6 +787,54 @@ mod tests {
                         target: "/a/../b".into(),
                         size_mib: 1,
                     })
+                }),
+            ),
+            (
+                "two FUSE mounts",
+                Box::new(|s| {
+                    for t in ["/a", "/b"] {
+                        s.mounts.push(Mount::Fuse {
+                            target: t.into(),
+                            socket: "/run/s/lazy.sock".into(),
+                        })
+                    }
+                }),
+            ),
+            (
+                "relative FUSE socket",
+                Box::new(|s| {
+                    s.mounts.push(Mount::Fuse {
+                        target: "/a".into(),
+                        socket: "lazy.sock".into(),
+                    })
+                }),
+            ),
+            (
+                "rebind outside a FUSE mount",
+                Box::new(|s| {
+                    s.mounts.push(Mount::Fuse {
+                        target: "/lazy".into(),
+                        socket: "/run/s/lazy.sock".into(),
+                    });
+                    s.mounts.push(Mount::Rebind {
+                        source: "/etc/passwd".into(),
+                        target: "/x".into(),
+                        writable: false,
+                    });
+                }),
+            ),
+            (
+                "rebind before its FUSE mount",
+                Box::new(|s| {
+                    s.mounts.push(Mount::Rebind {
+                        source: "/lazy/memory".into(),
+                        target: "/x".into(),
+                        writable: false,
+                    });
+                    s.mounts.push(Mount::Fuse {
+                        target: "/lazy".into(),
+                        socket: "/run/s/lazy.sock".into(),
+                    });
                 }),
             ),
             (
@@ -816,7 +924,7 @@ mod tests {
 
     #[test]
     fn the_vmm_sandbox_is_an_empty_root_with_the_callers_ids() {
-        let s = vmm_spec(&spec(), Path::new("/bin/vmm"), &["--x".into()]);
+        let s = vmm_spec(&spec(), Path::new("/bin/vmm"), &["--x".into()], &[]);
         assert_eq!(s.root, Root::Empty);
         assert_eq!(s.ids, Ids::Caller);
         assert!(!s.nest && !s.seccomp);
@@ -833,7 +941,7 @@ mod tests {
 
     #[test]
     fn the_vmm_sees_only_its_devices_kernel_disks_and_directory() {
-        let t = targets(&vmm_spec(&spec(), Path::new("/bin/vmm"), &[]).mounts);
+        let t = targets(&vmm_spec(&spec(), Path::new("/bin/vmm"), &[], &[]).mounts);
         let expected: Vec<(&str, &str, bool)> = vec![
             ("/dev/kvm", "/dev/kvm", true),
             ("/dev/null", "/dev/null", true),

@@ -30,7 +30,8 @@ Version 0.1.0. Not published to crates.io; consumers depend on it by git revisio
 | VMM sandbox (`vmkit-sandbox`) | Works | Linux only. Refuses to run as root. |
 | General program sandbox (`vmkit::sandbox::spawn`) | Works | Linux 5.12 or later; subordinate ids need `newuidmap`/`newgidmap`. |
 | cgroup limits | Works when available | Only with a systemd user session that can create scopes (`vmkit::cgroups_available()`). Otherwise skipped. |
-| Snapshot and restore | Not implemented | `Vm::snapshot` and `Vmm::restore` exist with their final signatures but return `Error::Unsupported`. |
+| Snapshot and restore | Works | Full snapshots of state, memory and writable disks into a bundle directory; restore into a fresh sandboxed VMM. Same VMM, version and arch only. Snapshot suite on aarch64 (Lima) and x86_64 (CI). |
+| Lazy restore | Works (Linux) | A FUSE mount in the sandbox serves memory and disks from verified chunks fetched on demand (`vmkit::lazy`). Lazy memory on Firecracker always; on Cloud Hypervisor only with userfaultfd access, else memory is copied in through the same layer. |
 | Balloon, drive remapping, diff snapshots | Not implemented | `Capabilities` reports what each backend could support; vmkit has no API for them yet. |
 | macOS | Builds only | The library compiles and its unit tests pass; creating VMs or sandboxes needs Linux. |
 | `base` kernel profile | Released | `kernels-6.18.54`: GitHub release assets and `ghcr.io/alfonsocampodonico/vmkit-kernels/base`. |
@@ -162,11 +163,12 @@ flowchart LR
 
 ### VM lifecycle
 
-The states a `Vm` goes through on both backends; snapshot and restore are not implemented yet.
+The states a `Vm` goes through on both backends.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Created: create(spec)
+    [*] --> Paused: restore(bundle, spec)
     note left of Created
         VMM running in the sandbox, devices
         configured, guest not started
@@ -174,6 +176,8 @@ stateDiagram-v2
     Created --> Running: start()
     Running --> Paused: pause()
     Paused --> Running: resume()
+    Running --> Paused: snapshot(dest)
+    Paused --> Paused: snapshot(dest)
     Running --> Ended: guest exits (reboot on FC, poweroff on CH)
     Running --> Ended: guest reset on CH (backstop stops VMM)
     Created --> Ended: kill()
@@ -195,7 +199,8 @@ What each step does on each backend:
 | `pause` / `resume` | `PATCH /vm` `Paused` / `Resumed` | `PUT /api/v1/vm.pause` / `vm.resume` |
 | `kill` | SIGKILL to the VMM (by pidfd, after checking it is still the helper's child), else to the helper | same |
 | guest ends the VM | `reboot` | `poweroff`; a reset is stopped by the backstop |
-| `snapshot` / `restore` | `Error::Unsupported` | `Error::Unsupported` |
+| `snapshot` | pause, `PUT /snapshot/create` (Full) into `/vm/sock/snapshot`, then the files move into the bundle and writable disks are copied sparsely | `vm.pause`, `vm.snapshot` into `/vm/sock/snapshot`, then the same |
+| `restore` | a fresh sandboxed `firecracker` with the bundle files bound at `/vm/snapshot`, then `PUT /snapshot/load` (File backend, paused) | a fresh `cloud-hypervisor` with the bundle files and a **rewritten** `config.json` (allowlisted fields, vmkit's own paths and Landlock rules) bound at `/vm/snapshot`, then `vm.restore` (paused; `Copy`, or `OnDemand` for lazy memory) |
 
 Dropping a `Vm` kills its VMM if it is still running.
 
@@ -294,10 +299,11 @@ All public items are re-exported from the crate root unless a module is named.
 | `Vmm::name()` | For logs only. |
 | `Vmm::capabilities() -> Capabilities` | See the table below. |
 | `Vmm::create(&VmSpec) -> Result<Box<dyn Vm>>` | Starts the VMM in the sandbox and configures it; the guest has not started. |
-| `Vmm::restore(&SnapshotBundle, &RestoreSpec)` | Returns `Error::Unsupported`. |
+| `Vmm::restore(&SnapshotBundle, &RestoreSpec) -> Result<Box<dyn Vm>>` | Checks the bundle (`bundle.json`, file set, sizes, VMM, version, arch) and restores it paused in a fresh VMM. `RestoreSpec::disks` gives each disk as `RestoreDisk::Captured` or `RestoreDisk::Host(path)`; `chunks` (a `vmkit::lazy::ChunkSource`) serves the files listed in the bundle's `lazy.json`; `scratch_dir` holds disk copies and lazy backing files. The bundle is never written. |
 | `Vm::start`, `pause`, `resume`, `kill` | Lifecycle; `kill` is idempotent and keeps the end reason of a VM that already ended. |
 | `Vm::wait() -> Result<VmEnd>`, `wait_timeout(Duration) -> Result<Option<VmEnd>>` | Block until the VMM exits. |
-| `Vm::snapshot(&Path)` | Returns `Error::Unsupported`. |
+| `Vm::snapshot(&Path) -> Result<SnapshotBundle>` | Pauses the VM and writes a bundle into an empty or missing directory; the VM stays paused. `SnapshotBundle::info()` reads its `BundleInfo`. |
+| `vmkit::lazy::{ChunkSource, LazyIndex, DirCache, split}` | Lazy restore: the chunk source trait (every chunk is verified by vmkit), the `lazy.json` index, a directory chunk cache, and a chunker. |
 | `Vm::vsock_socket() -> Option<&Path>` | Host side of the vsock device. |
 | `VmEnd { reason, code, signal }`, `EndReason::{Exited, Killed, ResetStopped, BackstopFailed}` | How the VM ended. |
 | `vmkit::cgroups_available()` | Whether sandboxes go into a systemd scope with limits; callers warn when false. |
@@ -313,6 +319,7 @@ All public items are re-exported from the crate root unless a module is named.
 | `guest_exit` | `Reboot` | `Poweroff` |
 | `console` | `ttyS0` | `ttyAMA0` on aarch64, `ttyS0` on x86_64 |
 | `supports_diff_snapshot`, `supports_balloon`, `supports_drive_remap` | true, true, true | false, true, false |
+| `lazy_memory` | true | true when the caller may use `/dev/userfaultfd` or `vm.unprivileged_userfaultfd` is 1 |
 
 The `supports_*` fields describe the backends; vmkit does not implement those features yet.
 
@@ -448,6 +455,7 @@ Hosted arm64 runners have no KVM, so the aarch64 kernel is boot-tested by hand a
 | `tests/contract.rs` | KVM, both VMMs, `VMKIT_TEST_KERNEL`, `VMKIT_TEST_INITRAMFS` | on both backends: boot and exit method, reset backstop, panic, kill, disk order, writes to sector 0, device budget, guest-initiated vsock, symlinked disks refused, a run directory with a comma, the sandbox's contents and privileges |
 | `tests/network.rs` | as contract, plus `testguest/net-fixture.sh` and `VMKIT_TEST_NET=1` | the hostile guest: metadata, private and host addresses, the gateway, other VMs and spoofed sources are unreachable; allowed destinations, DNS and port forwards work; an `allow` entry for the outbound address is refused; a host port in use fails with `pasta`'s message |
 | `tests/pause.rs` | as contract | pause stops the guest, resume continues it |
+| `tests/snapshot.rs` | as contract | snapshot and restore (local and lazy) continue the guest with its memory, disk and new vsock connections; a bundle restores twice and is never written; foreign, tampered and lazily corrupted bundles are refused |
 
 Without their variables the Linux suites skip each test; `VMKIT_REQUIRE_KVM_TESTS=1` turns a skip into a failure.
 
@@ -472,6 +480,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, clippy and the unit te
 Notes:
 
 - Pause and resume run alone: Cloud Hypervisor 53 on aarch64 can leave a guest stuck after a resume while other VMs load the host. That was reproduced with plain `ch-remote` under nested virtualization; Firecracker is unaffected.
+- The snapshot suite runs alone too. On aarch64 under nested virtualization, a Cloud Hypervisor 53 guest restored from a snapshot does not run after `resume`: it printed nothing for a minute. That was reproduced with plain `cloud-hypervisor` and `ch-remote`, with no vmkit involved. The Cloud Hypervisor restore tests are judged on x86_64, where they pass; the bundle checks pass on both. A `Copy` restore there also takes seconds to minutes.
 - Keep the contract suite's `--test-threads` at about half the CPUs; under heavier load, Cloud Hypervisor guests also stalled occasionally on the same nested setup.
 - A failing test prints the end of the guest console. Each VM's run directory also holds the VMM's own log.
 - `testguest/smoke.sh <kernel> <initramfs>` boots the test guest once on each VMM without vmkit, to check a kernel and initramfs on their own.

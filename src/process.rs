@@ -205,7 +205,19 @@ impl Proc {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<http::Response> {
-        match http::request(socket, method, path, body) {
+        self.request_timeout(socket, method, path, body, http::TIMEOUT)
+    }
+
+    /// [`Proc::request`] with its own timeout (snapshot and restore).
+    pub(crate) fn request_timeout(
+        &self,
+        socket: &Path,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        timeout: Duration,
+    ) -> Result<http::Response> {
+        match http::request_timeout(socket, method, path, body, timeout) {
             Err(Error::Io(io)) => {
                 // The exit may be a moment behind the closed connection.
                 match self.wait(Some(DEATH_GRACE))? {

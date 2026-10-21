@@ -60,3 +60,4 @@ jobs:
           cargo test --test contract -- --test-threads=$threads
           cargo test --test network -- --test-threads=$threads
           cargo test --test pause -- --test-threads=1
+          cargo test --test snapshot -- --test-threads=1

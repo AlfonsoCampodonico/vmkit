@@ -71,7 +71,7 @@ pub(crate) fn parse_version(text: &str) -> Option<Version> {
     Some((major, minor, patch))
 }
 
-fn show(v: Version) -> String {
+pub(crate) fn show(v: Version) -> String {
     format!("{}.{}.{}", v.0, v.1, v.2)
 }
 

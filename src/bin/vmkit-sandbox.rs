@@ -473,6 +473,47 @@ mod linux {
         .unwrap_or_else(|e| fail(&format!("mounting a tmpfs on {}", target.display()), e));
     }
 
+    /// Mounts FUSE on `target` for the caller's ids only, and hands the `/dev/fuse` descriptor to
+    /// the server listening on `socket` (outside the sandbox). `/dev/fuse` is opened here, in
+    /// the sandbox's user namespace, because the kernel requires the descriptor's opener to
+    /// share the user namespace of the mount. The descriptor is close-on-exec and dropped
+    /// after sending: the program must never get the server's end of its own disks.
+    fn fuse(target: &Path, socket: &Path) {
+        use std::io::IoSlice;
+        use std::mem::MaybeUninit;
+
+        use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
+
+        fs::create_dir_all(target).unwrap_or_else(|e| fail(&format!("mkdir {}", target.display()), e));
+        let dev = rustix::fs::open("/dev/fuse", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
+            .unwrap_or_else(|e| fail("opening /dev/fuse", e));
+        let options = std::ffi::CString::new(format!(
+            "fd={},rootmode=40000,user_id={},group_id={},default_permissions,max_read=131072",
+            dev.as_raw_fd(),
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw()
+        ))
+        .unwrap_or_else(|e| fail("fuse options", e));
+        mount(
+            "vmkit-lazy",
+            target,
+            "fuse",
+            MountFlags::NOSUID | MountFlags::NODEV,
+            Some(options.as_c_str()),
+        )
+        .unwrap_or_else(|e| fail(&format!("mounting FUSE on {}", target.display()), e));
+        let server =
+            UnixStream::connect(socket).unwrap_or_else(|e| fail(&format!("connecting {}", socket.display()), e));
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        let fds = [dev.as_fd()];
+        if !control.push(SendAncillaryMessage::ScmRights(&fds)) {
+            fail("sending the FUSE descriptor", "no room for it");
+        }
+        sendmsg(&server, &[IoSlice::new(b"F")], &mut control, SendFlags::empty())
+            .unwrap_or_else(|e| fail("sending the FUSE descriptor", e));
+    }
+
     fn init(plan_path: &str) {
         // If the outer helper dies, so does everything in this PID namespace.
         set_parent_process_death_signal(Some(Signal::KILL)).unwrap_or_else(|e| fail("pdeathsig", e));
@@ -572,6 +613,12 @@ mod linux {
                     writable,
                 } => attach(source, &inside(target), *writable, create),
                 Mount::Tmpfs { target, size_mib } => tmpfs(&inside(target), *size_mib),
+                Mount::Fuse { target, socket } => fuse(&inside(target), socket),
+                Mount::Rebind {
+                    source,
+                    target,
+                    writable,
+                } => attach(&inside(source), &inside(target), *writable, create),
             }
         }
         // pivot_root(".", ".") stacks the old root under the new one, so the new root needs no

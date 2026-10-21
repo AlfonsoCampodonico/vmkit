@@ -13,7 +13,8 @@ pub trait Vmm: Send + Sync {
     fn capabilities(&self) -> Capabilities;
     /// Starts a VMM process and configures `spec` in it; the guest has not started.
     fn create(&self, spec: &VmSpec) -> Result<Box<dyn Vm>>;
-    /// Restores a snapshot into a fresh VMM process (implemented by project #2).
+    /// Restores a snapshot into a fresh VMM process, paused: `Vm::resume` starts the guest.
+    /// Only the VMM, version and architecture that took the snapshot restore it.
     fn restore(&self, bundle: &SnapshotBundle, spec: &RestoreSpec) -> Result<Box<dyn Vm>>;
 }
 
@@ -29,7 +30,8 @@ pub trait Vm: Send {
     fn wait(&mut self) -> Result<VmEnd>;
     /// Like `wait`, but gives up after `timeout`.
     fn wait_timeout(&mut self, timeout: Duration) -> Result<Option<VmEnd>>;
-    /// Writes a snapshot to `dest` (implemented by project #2).
+    /// Pauses the VM and writes a snapshot into `dest`, an empty or missing directory. The VM
+    /// stays paused: resume it, or kill it.
     fn snapshot(&mut self, dest: &Path) -> Result<SnapshotBundle>;
     fn capabilities(&self) -> Capabilities;
     /// The host side of the vsock device, if the spec had one.
