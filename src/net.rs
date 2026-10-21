@@ -224,7 +224,7 @@ impl NetSpec {
     }
 
     /// Rejects an `allow` entry that is only one of `copied`, the host addresses `pasta
-    /// --config-net` copies into the VM's namespace ([`outbound_address`]): packets to
+    /// --config-net` copies into the VM's namespace ([`outbound_address`], [`outbound_address6`]): packets to
     /// them never leave the namespace, so such an exception could never work. A wider
     /// entry that includes one still works for its other addresses; callers may warn.
     /// Under `Open`, `allow` is unused and nothing is checked.
@@ -455,6 +455,48 @@ pub fn outbound_address() -> Option<Ipv4Addr> {
         std::net::IpAddr::V4(a) if !a.is_unspecified() => Some(a),
         _ => None,
     }
+}
+
+/// The host's IPv6 address on its default route, which `pasta --config-net` copies into the
+/// VM's namespace as it does [`outbound_address`]. `None` without an IPv6 default route.
+pub fn outbound_address6() -> Option<Ipv6Addr> {
+    let s = std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).ok()?;
+    // Documentation: routed by the default route, never by a more specific one.
+    s.connect((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 9)).ok()?;
+    match s.local_addr().ok()?.ip() {
+        IpAddr::V6(a) if !a.is_unspecified() => Some(a),
+        _ => None,
+    }
+}
+
+/// The host's IPv6 addresses and the prefixes it reaches without a gateway (its links, and
+/// device routes such as a VPN's), from `/proc/net/ipv6_route`: on IPv6 these are usually
+/// global prefixes, which [`RESTRICTED6`] does not cover. Default routes, routes through a
+/// gateway and rejects (`RTF_REJECT`, which also marks prefix routes through `lo`) are left out.
+pub(crate) fn host_prefixes6(ipv6_route: &str) -> Vec<Cidr> {
+    const RTF_REJECT: u32 = 0x200;
+    let mut found = Vec::new();
+    for line in ipv6_route.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let [dest, plen, _, _, next_hop, _, _, _, flags, _] = f[..] else {
+            continue;
+        };
+        let (Ok(dest), Ok(plen), Ok(next_hop), Ok(flags)) = (
+            u128::from_str_radix(dest, 16),
+            u8::from_str_radix(plen, 16),
+            u128::from_str_radix(next_hop, 16),
+            u32::from_str_radix(flags, 16),
+        ) else {
+            continue;
+        };
+        if plen == 0 || next_hop != 0 || flags & RTF_REJECT != 0 {
+            continue;
+        }
+        if let Some(c) = Cidr::new(Ipv6Addr::from(dest), plen).filter(|c| !found.contains(c)) {
+            found.push(c);
+        }
+    }
+    found
 }
 
 /// The host's local IPv4 addresses, from `/proc/net/fib_trie`.
@@ -859,6 +901,40 @@ mod tests {
         let mut other = fwd(80, 81);
         other.address = Ipv4Addr::UNSPECIFIED;
         assert!(spec(vec![fwd(80, 80), other]).check().is_err());
+    }
+
+    #[test]
+    fn the_hosts_ipv6_prefixes_are_its_addresses_and_gatewayless_routes() {
+        // Captured on Linux 7.0 with the network suite's fixture (testguest/net-fixture.sh).
+        let routes = "\
+3ffe0000000000000000000000000007 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00200200       lo
+3ffe0000000000010000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000002 00000000 00000001    vmkt6
+20000000000000000000000000000000 03 00000000000000000000000000000000 00 00000000000000000000000000000000 00001000 00000001 00000000 00200200       lo
+fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth0
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 3ffe00000000000100000000000000fe 00001000 00000001 00000000 00000003    vmkt6
+2a010000000000000000000000000000 20 00000000000000000000000000000000 00 3ffe00000000000100000000000000fe 00000400 00000001 00000000 00000003    vmkt6
+00000000000000000000000000000001 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 0000000b 00000000 80200001       lo
+3ffe0000000000000000000000000007 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 00000002 00000000 80200001       lo
+3ffe0000000000010000000000000001 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 00000003 00000000 80200001    vmkt6
+ff000000000000000000000000000000 08 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 0000000a 00000000 00000001     eth0
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo
+garbage
+";
+        let got: Vec<String> = host_prefixes6(routes).iter().map(Cidr::to_string).collect();
+        // Not the default routes, the route through a gateway (2a01::/32), or the rejects
+        // (unreachable 2000::/3, and the prefix route of an address on lo).
+        assert_eq!(
+            got,
+            [
+                "3ffe:0:0:1::/64",
+                "fe80::/64",
+                "::1/128",
+                "3ffe::7/128",
+                "3ffe:0:0:1::1/128",
+                "ff00::/8"
+            ]
+        );
+        assert!(host_prefixes6("").is_empty());
     }
 
     #[test]

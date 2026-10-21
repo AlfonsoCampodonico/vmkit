@@ -14,7 +14,7 @@
 //! `/vm/kernel`, `/vm/initramfs`, `/vm/disk/<n>` and `/vm/sock/`, which is `<run_dir>/sock`
 //! on the host. Its paths never depend on where files live on the host.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{ChildStderr, ChildStdout, ExitStatus};
@@ -549,14 +549,23 @@ pub(crate) fn vmm_spec(spec: &VmSpec, vmm: &Path, args: &[String], extra: &[Moun
     }
 }
 
-/// The policy half of a network plan: the ruleset for the host's current addresses. An
-/// `allow` entry that is only the address pasta copies is refused ([`NetSpec::check_allow`]).
+/// The policy half of a network plan: the ruleset for the host's current addresses and IPv6
+/// prefixes. An `allow` entry that is only an address pasta copies is refused
+/// ([`NetSpec::check_allow`]).
 fn policy(n: &NetSpec, ruleset: fn(&NetSpec, &[Cidr]) -> String) -> Result<Policy> {
-    let copied: Vec<IpAddr> = net::outbound_address().into_iter().map(IpAddr::V4).collect();
+    let copied: Vec<IpAddr> = (net::outbound_address().map(IpAddr::V4).into_iter())
+        .chain(net::outbound_address6().map(IpAddr::V6))
+        .collect();
     n.check_allow(&copied).map_err(Error::InvalidSpec)?;
+    // A host without IPv6 has no `ipv6_route`.
+    let routes6 = match std::fs::read_to_string("/proc/net/ipv6_route") {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        r => r?,
+    };
     let host: Vec<Cidr> = net::host_addresses(&std::fs::read_to_string("/proc/net/fib_trie")?)
         .into_iter()
         .filter_map(|a| Cidr::new(a, 32))
+        .chain(net::host_prefixes6(&routes6))
         .collect();
     Ok(Policy {
         nft: binary::find_system("nft")?,
@@ -875,7 +884,7 @@ mod tests {
                     s.network = Network::Egress(NetSpec {
                         forwards: vec![net::PortForward {
                             protocol: net::Protocol::Tcp,
-                            address: Ipv4Addr::LOCALHOST,
+                            address: std::net::Ipv4Addr::LOCALHOST,
                             host: 8080,
                             guest: 80,
                         }],
