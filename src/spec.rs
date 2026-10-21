@@ -60,6 +60,9 @@ pub struct Capabilities {
     pub supports_diff_snapshot: bool,
     pub supports_balloon: bool,
     pub supports_drive_remap: bool,
+    /// Whether a lazy restore maps guest memory on demand. When false, a lazy restore still
+    /// works, but fetches all of the memory (not its zero chunks) before the guest resumes.
+    pub lazy_memory: bool,
     pub guest_exit: GuestExit,
     /// The guest console device, e.g. `ttyS0`.
     pub console: &'static str,
@@ -96,18 +99,54 @@ pub struct VmEnd {
     pub signal: Option<i32>,
 }
 
-/// A snapshot on disk (implemented by project #2; the shape is fixed now).
+/// A snapshot on disk: `bundle.json`, the VMM's files and the captured disks (see
+/// [`crate::BundleInfo`]). A bundle is never modified by restoring it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotBundle {
     pub dir: PathBuf,
 }
 
-/// Where a restored VM's resources live (implemented by project #2).
+/// Where a disk of a restored VM comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreDisk {
+    /// The content the bundle captured (writable disks always are).
+    Captured,
+    /// A host file holding what the disk held when the snapshot was taken (read-only disks,
+    /// which bundles do not capture).
+    Host(PathBuf),
+}
+
+/// Where a restored VM's resources live.
+#[derive(Clone)]
 pub struct RestoreSpec {
-    pub disks: Vec<Disk>,
+    /// One per disk of the snapshot, in order.
+    pub disks: Vec<RestoreDisk>,
+    /// Guest serial output is appended here, as for [`VmSpec::console_log`].
     pub console_log: PathBuf,
+    /// A private (0700) directory for this VM, as for [`VmSpec::run_dir`]; it must exist.
     pub run_dir: PathBuf,
+    /// A NIC, present exactly when the snapshot's VM had one.
+    pub net: Option<NetSpec>,
+    /// Serves the bundle's files that are not in its directory but in its `lazy.json`
+    /// (lazy restore, Linux). Every chunk is verified, whatever the source.
+    pub chunks: Option<std::sync::Arc<dyn crate::lazy::ChunkSource>>,
+    /// Where the restored VM's large files go: copies of captured disks and the local backing
+    /// of lazily served files. `None` means `run_dir`, often a tmpfs; give a directory on disk
+    /// for VMs with large memory or disks.
+    pub scratch_dir: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for RestoreSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestoreSpec")
+            .field("disks", &self.disks)
+            .field("console_log", &self.console_log)
+            .field("run_dir", &self.run_dir)
+            .field("net", &self.net)
+            .field("chunks", &self.chunks.as_ref().map(|_| "..."))
+            .field("scratch_dir", &self.scratch_dir)
+            .finish()
+    }
 }
 
 impl VmSpec {
@@ -200,6 +239,7 @@ mod tests {
         supports_diff_snapshot: false,
         supports_balloon: true,
         supports_drive_remap: false,
+        lazy_memory: false,
         guest_exit: GuestExit::Poweroff,
         console: "ttyAMA0",
     };

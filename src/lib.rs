@@ -3,27 +3,34 @@
 #![forbid(unsafe_code)]
 
 mod binary;
+mod bundle;
+mod ch_config;
 mod cloud_hypervisor;
 mod error;
 mod events;
 mod firecracker;
 mod http;
+pub mod lazy;
 pub mod net;
 mod process;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub mod seccomp;
+mod snapshot;
 mod spec;
 mod subid;
 mod vmm;
 
+pub use bundle::{BUNDLE_FILE, BUNDLE_VERSION, BundleInfo, BundleVsock, DiskInfo, FileInfo, Role, VmmId, disk_file};
 pub use cloud_hypervisor::CloudHypervisor;
 pub use error::{Error, Result};
 pub use firecracker::Firecracker;
 pub use net::NetSpec;
 pub use sandbox::cgroups_available;
-pub use spec::{Capabilities, Disk, EndReason, GuestExit, RestoreSpec, SnapshotBundle, VmEnd, VmSpec, VsockSpec};
+pub use spec::{
+    Capabilities, Disk, EndReason, GuestExit, RestoreDisk, RestoreSpec, SnapshotBundle, VmEnd, VmSpec, VsockSpec,
+};
 pub use vmm::{Vm, Vmm};
 
 /// The backends `vmkit` drives.

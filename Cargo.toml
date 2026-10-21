@@ -10,11 +10,12 @@ description = "VMM-neutral microVM lifecycle for Firecracker and Cloud Hyperviso
 libc = "0.2.189"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.11.0"
 thiserror = "2.0.21"
 
 [dev-dependencies]
 tempfile = "3.27.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1.1.5", features = ["thread", "mount", "process", "fs", "stdio"] }
+rustix = { version = "1.1.5", features = ["thread", "mount", "process", "fs", "stdio", "net"] }
 seccompiler = "0.5"

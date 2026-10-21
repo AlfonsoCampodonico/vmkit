@@ -38,6 +38,8 @@ pub enum Error {
     Unsupported(&'static str),
     #[error("the VMM exited before it was ready ({0})")]
     EarlyExit(String),
+    #[error("snapshot: {0}")]
+    Snapshot(String),
     #[error("timed out waiting for {0}")]
     Timeout(String),
 }
