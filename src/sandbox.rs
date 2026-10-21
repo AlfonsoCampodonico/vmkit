@@ -14,7 +14,7 @@
 //! `/vm/kernel`, `/vm/initramfs`, `/vm/disk/<n>` and `/vm/sock/`, which is `<run_dir>/sock`
 //! on the host. Its paths never depend on where files live on the host.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{ChildStderr, ChildStdout, ExitStatus};
@@ -552,8 +552,8 @@ pub(crate) fn vmm_spec(spec: &VmSpec, vmm: &Path, args: &[String], extra: &[Moun
 /// The policy half of a network plan: the ruleset for the host's current addresses. An
 /// `allow` entry that is only the address pasta copies is refused ([`NetSpec::check_allow`]).
 fn policy(n: &NetSpec, ruleset: fn(&NetSpec, &[Ipv4Addr]) -> String) -> Result<Policy> {
-    n.check_allow(net::outbound_address().as_slice())
-        .map_err(Error::InvalidSpec)?;
+    let copied: Vec<IpAddr> = net::outbound_address().into_iter().map(IpAddr::V4).collect();
+    n.check_allow(&copied).map_err(Error::InvalidSpec)?;
     let host: Vec<Ipv4Addr> = net::host_addresses(&std::fs::read_to_string("/proc/net/fib_trie")?);
     Ok(Policy {
         nft: binary::find_system("nft")?,

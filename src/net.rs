@@ -2,7 +2,7 @@
 //! nftables policy and `pasta` for unprivileged egress through host sockets.
 
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -38,29 +38,45 @@ const RESTRICTED: [&str; 10] = [
     "224.0.0.0/3",
 ];
 
-/// An IPv4 network such as `10.0.0.0/8`; a bare address is a `/32`.
+/// An IPv4 or IPv6 network such as `10.0.0.0/8` or `2001:db8::/32`; a bare address is a
+/// `/32` or a `/128`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Cidr {
-    addr: Ipv4Addr,
+    addr: IpAddr,
     prefix: u8,
+}
+
+/// `addr` with every bit after the first `prefix` cleared.
+fn network(addr: IpAddr, prefix: u8) -> IpAddr {
+    match addr {
+        IpAddr::V4(a) => {
+            let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+            IpAddr::V4(Ipv4Addr::from(u32::from(a) & mask))
+        }
+        IpAddr::V6(a) => {
+            let mask = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+            IpAddr::V6(Ipv6Addr::from(u128::from(a) & mask))
+        }
+    }
 }
 
 impl Cidr {
     /// The network containing `addr` (host bits are cleared).
-    pub fn new(addr: Ipv4Addr, prefix: u8) -> Option<Self> {
-        if prefix > 32 {
+    pub fn new(addr: impl Into<IpAddr>, prefix: u8) -> Option<Self> {
+        let addr = addr.into();
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        if prefix > max {
             return None;
         }
-        let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
         Some(Self {
-            addr: Ipv4Addr::from(u32::from(addr) & mask),
+            addr: network(addr, prefix),
             prefix,
         })
     }
 
     /// The network address (host bits cleared).
-    pub fn addr(&self) -> Ipv4Addr {
+    pub fn addr(&self) -> IpAddr {
         self.addr
     }
 
@@ -69,10 +85,14 @@ impl Cidr {
         self.prefix
     }
 
-    /// Whether `addr` is in this network.
-    pub fn contains(&self, addr: Ipv4Addr) -> bool {
-        let mask = u32::MAX.checked_shl(32 - u32::from(self.prefix)).unwrap_or(0);
-        u32::from(addr) & mask == u32::from(self.addr)
+    /// Whether this is an IPv6 network.
+    pub fn is_ipv6(&self) -> bool {
+        self.addr.is_ipv6()
+    }
+
+    /// Whether `addr` is in this network (never across address families).
+    pub fn contains(&self, addr: IpAddr) -> bool {
+        addr.is_ipv6() == self.is_ipv6() && network(addr, self.prefix) == self.addr
     }
 }
 
@@ -80,12 +100,15 @@ impl FromStr for Cidr {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, String> {
-        let bad = || format!("{s:?} is not an IPv4 address or CIDR");
-        let (addr, prefix) = match s.split_once('/') {
-            Some((a, p)) => (a, p.parse::<u8>().map_err(|_| bad())?),
-            None => (s, 32),
+        let bad = || format!("{s:?} is not an IP address or CIDR");
+        let (addr, prefix) = s.split_once('/').map_or((s, None), |(a, p)| (a, Some(p)));
+        let addr: IpAddr = addr.parse().map_err(|_| bad())?;
+        let prefix = match prefix {
+            Some(p) => p.parse::<u8>().map_err(|_| bad())?,
+            None if addr.is_ipv4() => 32,
+            None => 128,
         };
-        Cidr::new(addr.parse().map_err(|_| bad())?, prefix).ok_or_else(bad)
+        Cidr::new(addr, prefix).ok_or_else(bad)
     }
 }
 
@@ -182,12 +205,15 @@ impl NetSpec {
     /// them never leave the namespace, so such an exception could never work. A wider
     /// entry that includes one still works for its other addresses; callers may warn.
     /// Under `Open`, `allow` is unused and nothing is checked.
-    pub fn check_allow(&self, copied: &[Ipv4Addr]) -> Result<(), String> {
+    pub fn check_allow(&self, copied: &[IpAddr]) -> Result<(), String> {
         if self.egress == Egress::Open {
             return Ok(());
         }
         for c in &self.allow {
-            if let Some(a) = copied.iter().find(|a| c.prefix() == 32 && c.addr() == **a) {
+            if let Some(a) = copied
+                .iter()
+                .find(|a| Some(*c) == Cidr::new(**a, if a.is_ipv4() { 32 } else { 128 }))
+            {
                 return Err(format!(
                     "the egress exception {c} is the host's own address {a}, which the VM can never reach \
                      (pasta gives the VM's namespace that address)"
@@ -425,10 +451,37 @@ mod tests {
         assert_eq!("1.2.3.4".parse::<Cidr>().unwrap().to_string(), "1.2.3.4/32");
         assert_eq!("0.0.0.0/0".parse::<Cidr>().unwrap().to_string(), "0.0.0.0/0");
         let c = "10.1.2.3/8".parse::<Cidr>().unwrap();
-        assert_eq!((c.addr(), c.prefix()), (Ipv4Addr::new(10, 0, 0, 0), 8));
-        for bad in ["1.2.3.4/33", "1.2.3/8", "x", "1.2.3.4/", "::1/128"] {
+        assert_eq!((c.addr(), c.prefix()), (IpAddr::from([10, 0, 0, 0]), 8));
+        for bad in [
+            "1.2.3.4/33",
+            "1.2.3/8",
+            "x",
+            "1.2.3.4/",
+            "::1/129",
+            "fe80::/",
+            "[::1]/128",
+        ] {
             assert!(bad.parse::<Cidr>().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn cidrs_may_be_ipv6() {
+        assert_eq!("2001:db8:1::1/32".parse::<Cidr>().unwrap().to_string(), "2001:db8::/32");
+        assert_eq!("::1".parse::<Cidr>().unwrap().to_string(), "::1/128");
+        assert_eq!("::/0".parse::<Cidr>().unwrap().to_string(), "::/0");
+        let c: Cidr = "fd00::/8".parse().unwrap();
+        assert!(c.is_ipv6() && !"10.0.0.0/8".parse::<Cidr>().unwrap().is_ipv6());
+        assert!(c.contains("fd00:ec2::254".parse().unwrap()));
+        assert!(!c.contains("fe80::1".parse().unwrap()));
+        // Never across families: ::/0 does not contain 0.0.0.0, nor 0.0.0.0/0 an IPv6 address.
+        assert!(!"::/0".parse::<Cidr>().unwrap().contains("1.2.3.4".parse().unwrap()));
+        assert!(!"0.0.0.0/0".parse::<Cidr>().unwrap().contains("::1".parse().unwrap()));
+        assert!(Cidr::new(Ipv6Addr::LOCALHOST, 129).is_none());
+        assert_eq!(
+            Cidr::new(Ipv6Addr::LOCALHOST, 128).unwrap().addr(),
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
     }
 
     #[test]
@@ -546,7 +599,7 @@ mod tests {
 
     #[test]
     fn an_allow_entry_that_is_the_hosts_outbound_address_is_refused() {
-        let copied = ["192.168.5.15".parse().unwrap()];
+        let copied = ["192.168.5.15".parse().unwrap(), "3ffe:0:0:1::1".parse().unwrap()];
         let spec = |egress, allow: &[&str]| NetSpec {
             egress,
             allow: allow.iter().map(|a| a.parse().unwrap()).collect(),
@@ -568,6 +621,19 @@ mod tests {
         // copied into the namespace) are reachable with an exception.
         assert!(
             spec(Egress::DenyAll, &["192.168.0.0/16", "10.250.0.1"])
+                .check_allow(&copied)
+                .is_ok()
+        );
+        // pasta copies the host's IPv6 address too.
+        let e = spec(Egress::Restricted, &["3ffe:0:0:1::1"])
+            .check_allow(&copied)
+            .unwrap_err();
+        assert!(
+            e.contains("3ffe:0:0:1::1/128 is the host's own address 3ffe:0:0:1::1"),
+            "{e}"
+        );
+        assert!(
+            spec(Egress::Restricted, &["3ffe:0:0:1::/64"])
                 .check_allow(&copied)
                 .is_ok()
         );
