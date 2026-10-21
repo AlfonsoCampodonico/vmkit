@@ -262,6 +262,15 @@ impl Restore {
                     bundle::copy_sparse(&crate::process::open_vmm_file(&bundle.file(&name))?, &copy)?;
                     copy
                 }
+                // A host file serves only a read-only disk, which bundles never capture. For a
+                // writable disk it would be bound writable, letting the guest write a file the
+                // caller shares (a base image, say), and a later snapshot would capture the
+                // bundle's copy instead of what the guest wrote.
+                RestoreDisk::Host(_) if !d.read_only => {
+                    return Err(Error::Snapshot(format!(
+                        "disk {n} is writable: restore it as RestoreDisk::Captured, not from a host file"
+                    )));
+                }
                 RestoreDisk::Host(path) => {
                     let size = std::fs::File::open(path)?.metadata()?.len();
                     if size != d.size {
@@ -527,6 +536,26 @@ mod tests {
         assert!(matches!(err, Err(Error::Snapshot(m)) if m.contains("not captured")));
         let err = Restore::prepare(&b, &spec(run2.path(), vec![RestoreDisk::Captured]), &expect());
         assert!(matches!(err, Err(Error::Snapshot(m)) if m.contains("2 disks")));
+    }
+
+    #[test]
+    fn a_writable_disk_never_comes_from_a_host_file() {
+        let (dir, b) = bundle();
+        let run = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("ro.img");
+        std::fs::write(&ro, vec![0u8; 4096]).unwrap();
+        let shared = dir.path().join("base.img");
+        std::fs::write(&shared, vec![0u8; 8192]).unwrap();
+        let err = Restore::prepare(
+            &b,
+            &spec(run.path(), vec![RestoreDisk::Host(ro), RestoreDisk::Host(shared)]),
+            &expect(),
+        );
+        assert!(
+            matches!(&err, Err(Error::Snapshot(m)) if m.contains("disk 1 is writable")),
+            "{:?}",
+            err.err()
+        );
     }
 
     #[test]

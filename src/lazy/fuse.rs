@@ -402,7 +402,12 @@ pub(crate) fn serve(dev: std::os::fd::OwnedFd, fs: Arc<Fs>, threads: usize) -> V
                         // ENODEV: unmounted. Anything else ends this worker as well.
                         Err(_) => return,
                     };
-                    if let Some(out) = fs.handle(&buf[..n]) {
+                    // A panic (in a chunk source, say) must still answer the request: an
+                    // unanswered read leaves the VMM's thread blocked, and the guest hung.
+                    let request = &buf[..n];
+                    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fs.handle(request)))
+                        .unwrap_or_else(|_| decode_header(request).map(|h| error(h.unique, libc::EIO)));
+                    if let Some(out) = out {
                         // ENOENT: the request was interrupted and its reply is not wanted.
                         let _ = rustix::io::write(&*dev, &out);
                     }

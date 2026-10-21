@@ -20,6 +20,13 @@ const HANDOVER: Duration = Duration::from_secs(60);
 /// Worker threads per mount: the VMM's vCPU and I/O threads fault in parallel.
 const WORKERS: usize = 4;
 
+/// A socket file's identity, from `lstat`.
+fn socket_id(path: &Path) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(path)?;
+    Ok((m.dev(), m.ino()))
+}
+
 /// `/dev/fuse` is character device 10:229.
 fn is_fuse_device(fd: &OwnedFd) -> io::Result<bool> {
     let st = rustix::fs::fstat(fd)?;
@@ -67,6 +74,7 @@ pub(crate) fn listen(run_dir: &Path, fs: Fs, log: super::file::Log) -> io::Resul
         _ => {}
     }
     let listener = UnixListener::bind(&path)?;
+    let ours = socket_id(&path)?;
     listener.set_nonblocking(true)?;
     let fs = Arc::new(fs);
     let socket = path.clone();
@@ -90,7 +98,11 @@ pub(crate) fn listen(run_dir: &Path, fs: Fs, log: super::file::Log) -> io::Resul
                 Err(e) => break Err(e),
             }
         };
-        let _ = std::fs::remove_file(&socket);
+        // Only our own socket: a later restore into the same run directory may have bound a
+        // new one at this path by now.
+        if socket_id(&socket).ok() == Some(ours) {
+            let _ = std::fs::remove_file(&socket);
+        }
         let failure = match result {
             Ok(fd) => match is_fuse_device(&fd) {
                 Ok(true) => {
