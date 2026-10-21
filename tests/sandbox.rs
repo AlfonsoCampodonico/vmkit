@@ -318,6 +318,21 @@ fn the_tap_has_the_ipv6_gateway_and_a_permanent_neighbour_for_the_guest() {
         neigh.starts_with("fd76:6d6b:6974::2 lladdr 06:00:ac:1e:00:02 ") && neigh.trim_end().ends_with("PERMANENT"),
         "{neigh}"
     );
+    // The namespace's own sysctls, through the sandbox's /proc: it forwards IPv6, and its tap
+    // takes no router advertisement or redirect from the guest.
+    let mut spec = s.spec(&[
+        "cat",
+        "/proc/sys/net/ipv6/conf/all/forwarding",
+        "/proc/sys/net/ipv6/conf/tap0/accept_ra",
+        "/proc/sys/net/ipv6/conf/tap0/accept_redirects",
+    ]);
+    spec.root = Root::Host;
+    spec.command.program = Program::Path(BUSYBOX.into());
+    spec.mounts.clear();
+    spec.network = Network::Tap(NetSpec::default());
+    let o = s.output(&spec);
+    assert!(o.status.success(), "{o:?}");
+    assert_eq!(stdout(&o), "1\n0\n0\n");
 }
 
 #[test]
