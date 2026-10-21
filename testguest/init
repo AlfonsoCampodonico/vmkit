@@ -1,18 +1,20 @@
 #!/bin/busybox sh
 # vmkit contract-suite guest. Kernel arguments:
-#   vmkit.test=<action>  up | reboot | panic | exit | idle | vsock | disks | sector0 | net
+#   vmkit.test=<action>  up | reboot | panic | exit | idle | vsock | disks | sector0 | net | count
 #   vmkit.exit=<method>  poweroff | reboot  (how "up", "vsock", "disks" and "net" end)
 #   vmkit.ip=<addr/len> vmkit.gw=<addr>  configure eth0 (with vmkit.test=net)
 #   vmkit.probe=<ip>:<port>  try a TCP connection (repeatable)
 #   vmkit.dns=<name>         resolve a name through the gateway (repeatable)
 #   vmkit.spoof=<addr/len>   then probe again from this unassigned source address
 #   vmkit.serve=<port>       serve HTTP on this port ("VMKIT-SERVED"), then wait for vmkit.hold=<seconds>
+#   vmkit.mark=<word>        with vmkit.test=count: written to sector 0 of vda, if there is one
+#   vmkit.vsock=<port>       with vmkit.test=count: try a vsock connection to the host each tick
 /bin/busybox mount -t proc proc /proc
 /bin/busybox mount -t sysfs sys /sys
 /bin/busybox mount -t devtmpfs dev /dev
 action=up
 method=poweroff
-ip= gw= probes= names= spoof= serve= hold=0
+ip= gw= probes= names= spoof= serve= hold=0 mark=1 vport=
 for arg in $(/bin/busybox cat /proc/cmdline); do
   case $arg in
     vmkit.test=*) action=${arg#vmkit.test=} ;;
@@ -24,6 +26,8 @@ for arg in $(/bin/busybox cat /proc/cmdline); do
     vmkit.spoof=*) spoof=${arg#vmkit.spoof=} ;;
     vmkit.serve=*) serve=${arg#vmkit.serve=} ;;
     vmkit.hold=*) hold=${arg#vmkit.hold=} ;;
+    vmkit.mark=*) mark=${arg#vmkit.mark=} ;;
+    vmkit.vsock=*) vport=${arg#vmkit.vsock=} ;;
   esac
 done
 probe() { # probe <label> <ip:port>
@@ -75,6 +79,23 @@ case $action in
     fi
     /bin/busybox sleep "$hold"
     end ;;
+  count)
+    # The counter lives in guest memory and the mark on the disk: a restored guest goes on
+    # counting from where its snapshot was taken, and reads the mark back with direct I/O.
+    if [ -b /dev/vda ]; then
+      echo "VMKIT-MARK-$mark" | /bin/busybox dd of=/dev/vda bs=512 count=1 conv=sync,fsync 2>/dev/null
+    fi
+    i=0
+    while :; do
+      i=$((i+1))
+      d=
+      if [ -b /dev/vda ]; then
+        d=$(/bin/busybox dd if=/dev/vda bs=512 count=1 iflag=direct 2>/dev/null | /bin/busybox head -n 1)
+      fi
+      echo "VMKIT-COUNT $i $d"
+      if [ -n "$vport" ]; then /bin/vsock-hello "$vport" 2>/dev/null; fi
+      /bin/busybox sleep 0.2
+    done ;;
   disks)
     for d in /sys/block/vd*; do echo "VMKIT-DISK $(/bin/busybox basename "$d") $(/bin/busybox cat "$d/size")"; done
     end ;;
