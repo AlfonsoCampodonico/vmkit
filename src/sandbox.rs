@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::binary;
 use crate::error::{Error, Result};
-use crate::net::{self, NetSpec};
+use crate::net::{self, Cidr, NetSpec};
 use crate::process::{self, Proc};
 use crate::spec::VmSpec;
 use crate::subid;
@@ -551,10 +551,13 @@ pub(crate) fn vmm_spec(spec: &VmSpec, vmm: &Path, args: &[String], extra: &[Moun
 
 /// The policy half of a network plan: the ruleset for the host's current addresses. An
 /// `allow` entry that is only the address pasta copies is refused ([`NetSpec::check_allow`]).
-fn policy(n: &NetSpec, ruleset: fn(&NetSpec, &[Ipv4Addr]) -> String) -> Result<Policy> {
+fn policy(n: &NetSpec, ruleset: fn(&NetSpec, &[Cidr]) -> String) -> Result<Policy> {
     let copied: Vec<IpAddr> = net::outbound_address().into_iter().map(IpAddr::V4).collect();
     n.check_allow(&copied).map_err(Error::InvalidSpec)?;
-    let host: Vec<Ipv4Addr> = net::host_addresses(&std::fs::read_to_string("/proc/net/fib_trie")?);
+    let host: Vec<Cidr> = net::host_addresses(&std::fs::read_to_string("/proc/net/fib_trie")?)
+        .into_iter()
+        .filter_map(|a| Cidr::new(a, 32))
+        .collect();
     Ok(Policy {
         nft: binary::find_system("nft")?,
         ruleset: ruleset(n, &host),
