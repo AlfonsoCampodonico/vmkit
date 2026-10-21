@@ -203,6 +203,11 @@ pub struct NetSpec {
     /// Exceptions to `Restricted` and `DenyAll`; ignored under `Egress::Open`.
     pub allow: Vec<Cidr>,
     pub forwards: Vec<PortForward>,
+    /// IPv6 egress too: the guest may use [`GUEST6`]/[`PREFIX6`] via [`GATEWAY6`], NAT'd like
+    /// its IPv4 address under the same policy. Off by default, so a guest that was not given
+    /// IPv6 cannot configure it itself; ignored on a host without IPv6.
+    #[serde(default)]
+    pub ipv6: bool,
 }
 
 impl NetSpec {
@@ -224,7 +229,7 @@ impl NetSpec {
     }
 
     /// Rejects an `allow` entry that is only one of `copied`, the host addresses `pasta
-    /// --config-net` copies into the VM's namespace ([`outbound_address`], [`outbound_address6`]): packets to
+    /// --config-net` copies into the VM's namespace ([`outbound_address`], [`outbound_addresses6`]): packets to
     /// them never leave the namespace, so such an exception could never work. A wider
     /// entry that includes one still works for its other addresses; callers may warn.
     /// Under `Open`, `allow` is unused and nothing is checked.
@@ -348,6 +353,31 @@ pub fn ruleset(spec: &NetSpec, host: &[Cidr]) -> String {
         deny6,
         allow6,
     } = sets(spec, host);
+    // Without IPv6 the guest's IPv6 is dropped, and nothing of it reaches the namespace.
+    let (guard, from_tap, to_egress, nd) = if spec.ipv6 {
+        let link = Cidr::new(GATEWAY6, PREFIX6).expect("a valid prefix");
+        (
+            format!(
+                "  chain guard {{
+    type filter hook prerouting priority raw; policy accept;
+    iifname \"{TAP}\" ip6 daddr {{ {link}, fe80::/10 }} ip6 daddr != {GATEWAY6} drop
+  }}
+"
+            ),
+            format!("    iifname \"{TAP}\" ip6 saddr != {GUEST6} drop\n"),
+            format!(
+                "    iifname \"{TAP}\" oifname \"{EGRESS}\" ip6 daddr @allow6 accept
+    iifname \"{TAP}\" oifname \"{EGRESS}\" ip6 daddr @deny6 drop
+"
+            ),
+            format!(
+                "    iifname \"{TAP}\" ip6 saddr {GUEST6} ip6 hoplimit 255 icmpv6 type nd-neighbor-solicit accept\n"
+            ),
+        )
+    } else {
+        let drop = format!("    iifname \"{TAP}\" meta nfproto ipv6 drop\n");
+        (String::new(), drop, String::new(), String::new())
+    };
     let mut prerouting = String::new();
     let mut output = String::new();
     for proto in ["udp", "tcp"] {
@@ -366,7 +396,7 @@ pub fn ruleset(spec: &NetSpec, host: &[Cidr]) -> String {
   set allow {{ type ipv4_addr; flags interval; auto-merge;{allow} }}
   set deny6 {{ type ipv6_addr; flags interval; auto-merge;{deny6} }}
   set allow6 {{ type ipv6_addr; flags interval; auto-merge;{allow6} }}
-  chain prerouting {{
+{guard}  chain prerouting {{
     type nat hook prerouting priority dstnat; policy accept;
 {prerouting}  }}
   chain output {{
@@ -380,20 +410,16 @@ pub fn ruleset(spec: &NetSpec, host: &[Cidr]) -> String {
   chain forward {{
     type filter hook forward priority filter; policy drop;
     iifname \"{TAP}\" ip saddr != {GUEST} drop
-    iifname \"{TAP}\" ip6 saddr != {GUEST6} drop
-    ct state established,related accept
+{from_tap}    ct state established,related accept
     ct status dnat accept
     iifname \"{TAP}\" oifname \"{EGRESS}\" ip daddr @allow accept
     iifname \"{TAP}\" oifname \"{EGRESS}\" ip daddr @deny drop
-    iifname \"{TAP}\" oifname \"{EGRESS}\" ip6 daddr @allow6 accept
-    iifname \"{TAP}\" oifname \"{EGRESS}\" ip6 daddr @deny6 drop
-    iifname \"{TAP}\" oifname \"{EGRESS}\" accept
+{to_egress}    iifname \"{TAP}\" oifname \"{EGRESS}\" accept
   }}
   chain input {{
     type filter hook input priority filter; policy accept;
     iifname \"{TAP}\" ct state established,related accept
-    iifname \"{TAP}\" ip6 saddr {GUEST6} ip6 hoplimit 255 icmpv6 type nd-neighbor-solicit accept
-    iifname \"{TAP}\" drop
+{nd}    iifname \"{TAP}\" drop
   }}
   chain local_out {{
     type filter hook output priority filter; policy accept;
@@ -404,11 +430,11 @@ pub fn ruleset(spec: &NetSpec, host: &[Cidr]) -> String {
     )
 }
 
-/// `pasta` options, without the namespace to attach to. With `ipv6` (the tap network) pasta
-/// also carries IPv6; `--config-net` sets `egress0`'s addresses and routes, so pasta's router
-/// advertisements and DHCPv6 are off. Without it (a bare namespace) pasta is IPv4-only.
+/// `pasta` options, without the namespace to attach to. With [`NetSpec::ipv6`] pasta also
+/// carries IPv6; `--config-net` sets `egress0`'s addresses and routes, so pasta's router
+/// advertisements and DHCPv6 are off. Without it pasta is IPv4-only.
 #[doc(hidden)]
-pub fn pasta_args(spec: &NetSpec, ipv6: bool) -> Vec<String> {
+pub fn pasta_args(spec: &NetSpec) -> Vec<String> {
     // One `--tcp-ports ADDRESS/PORT` per forward: pasta binds each to its own address.
     let ports = |flag: &str, p: Protocol| {
         let list: Vec<String> = spec
@@ -440,7 +466,7 @@ pub fn pasta_args(spec: &NetSpec, ipv6: bool) -> Vec<String> {
     ]
     .map(String::from)
     .to_vec();
-    if ipv6 {
+    if spec.ipv6 {
         args.extend(["--no-ra", "--no-dhcpv6"].map(String::from));
     } else {
         args.push("--ipv4-only".into());
@@ -463,22 +489,59 @@ pub fn outbound_address() -> Option<Ipv4Addr> {
     }
 }
 
-/// The host's IPv6 address on its default route, which `pasta --config-net` copies into the
-/// VM's namespace as it does [`outbound_address`]. `None` without an IPv6 default route.
-pub fn outbound_address6() -> Option<Ipv6Addr> {
-    let s = std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).ok()?;
-    // Documentation: routed by the default route, never by a more specific one.
-    s.connect((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 9)).ok()?;
-    match s.local_addr().ok()?.ip() {
-        IpAddr::V6(a) if !a.is_unspecified() => Some(a),
-        _ => None,
-    }
+/// Whether the host has IPv6 at all (not booted with `ipv6.disable=1`, built with it): without
+/// it, [`NetSpec::ipv6`] is ignored and the VM network stays IPv4-only.
+pub fn host_has_ipv6() -> bool {
+    std::path::Path::new("/proc/sys/net/ipv6").exists()
+}
+
+/// The host's IPv6 addresses that `pasta --config-net` copies into the VM's namespace, as it
+/// does [`outbound_address`]: the global addresses of the interface on the default route.
+/// Empty without IPv6 or an IPv6 default route.
+pub fn outbound_addresses6() -> Vec<Ipv6Addr> {
+    let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+    default_route_addresses6(&read("/proc/net/ipv6_route"), &read("/proc/net/if_inet6"))
+}
+
+/// The global addresses (`/proc/net/if_inet6`) of the interface on the lowest-metric default
+/// route (`/proc/net/ipv6_route`) that is not a reject.
+pub(crate) fn default_route_addresses6(ipv6_route: &str, if_inet6: &str) -> Vec<Ipv6Addr> {
+    const RTF_REJECT: u32 = 0x200;
+    let device = ipv6_route
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let [_, plen, _, _, _, metric, _, _, flags, dev] = f[..] else {
+                return None;
+            };
+            let metric = u32::from_str_radix(metric, 16).ok()?;
+            let reject = u32::from_str_radix(flags, 16).ok()? & RTF_REJECT != 0;
+            (plen == "00" && !reject).then_some((metric, dev))
+        })
+        .min()
+        .map(|(_, dev)| dev);
+    let Some(device) = device else {
+        return Vec::new();
+    };
+    if_inet6
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let [addr, _, _, scope, _, dev] = f[..] else {
+                return None;
+            };
+            (dev == device && scope == "00").then(|| u128::from_str_radix(addr, 16).ok().map(Ipv6Addr::from))?
+        })
+        .collect()
 }
 
 /// The host's IPv6 addresses and the prefixes it reaches without a gateway (its links, and
-/// device routes such as a VPN's), from `/proc/net/ipv6_route`: on IPv6 these are usually
-/// global prefixes, which [`RESTRICTED6`] does not cover. Default routes, routes through a
-/// gateway and rejects (`RTF_REJECT`, which also marks prefix routes through `lo`) are left out.
+/// device routes such as a VPN's), from `/proc/net/ipv6_route`, each widened to its /56: on
+/// IPv6 these are usually global prefixes, which [`RESTRICTED6`] does not cover, and a /56 is
+/// the usual end-site allocation (a cloud VPC, a home's delegated prefix), so the subnets the
+/// host reaches through its router are denied too, as RFC 1918 ones are over IPv4. Default
+/// routes, routes through a gateway and rejects (`RTF_REJECT`, which also marks prefix routes
+/// through `lo`) are left out.
 pub(crate) fn host_prefixes6(ipv6_route: &str) -> Vec<Cidr> {
     const RTF_REJECT: u32 = 0x200;
     let mut found = Vec::new();
@@ -498,7 +561,7 @@ pub(crate) fn host_prefixes6(ipv6_route: &str) -> Vec<Cidr> {
         if plen == 0 || next_hop != 0 || flags & RTF_REJECT != 0 {
             continue;
         }
-        if let Some(c) = Cidr::new(Ipv6Addr::from(dest), plen).filter(|c| !found.contains(c)) {
+        if let Some(c) = Cidr::new(Ipv6Addr::from(dest), plen.min(56)).filter(|c| !found.contains(c)) {
             found.push(c);
         }
     }
@@ -626,6 +689,56 @@ mod tests {
         assert!(!r.contains("elements"), "open has no deny or allow entries:\n{r}");
     }
 
+    /// The default spec with IPv6 on.
+    fn v6() -> NetSpec {
+        NetSpec {
+            ipv6: true,
+            ..NetSpec::default()
+        }
+    }
+
+    #[test]
+    fn ipv6_is_off_unless_asked_for() {
+        // Without `ipv6` the tap network is IPv4-only, as before: IPv6 from the guest is
+        // dropped, nothing of it reaches the namespace, and pasta is IPv4-only.
+        assert!(!NetSpec::default().ipv6);
+        let r = ruleset(&NetSpec::default(), &[]);
+        let at = |needle: &str| r.find(needle).unwrap_or_else(|| panic!("{needle} missing:\n{r}"));
+        assert!(at("iifname \"tap0\" meta nfproto ipv6 drop") < at("ct state established,related accept"));
+        for absent in [
+            "fd76:6d6b:6974",
+            "@allow6",
+            "@deny6",
+            "nd-neighbor-solicit",
+            "chain guard",
+        ] {
+            assert!(!r.contains(absent), "{absent}:\n{r}");
+        }
+        assert!(pasta_args(&NetSpec::default()).contains(&"--ipv4-only".to_string()));
+        // Plans written before the field existed stay IPv4-only.
+        let old: NetSpec = serde_json::from_str(r#"{"egress":"Restricted","allow":[],"forwards":[]}"#).unwrap();
+        assert!(!old.ipv6);
+    }
+
+    #[test]
+    fn the_guest_cannot_make_the_namespace_route_back_to_the_tap() {
+        // A packet to another address on the tap's link would be forwarded back out of the
+        // tap, and the kernel's redirect for it creates a neighbour entry before the forward
+        // chain drops it; the guard drops it first. The gateway itself stays reachable (the
+        // guest's solicitations), and so does everything off the link.
+        let r = ruleset(&v6(), &[]);
+        let guard = &r[r.find("chain guard {").unwrap_or_else(|| panic!("{r}"))..];
+        let guard = &guard[..guard.find("  }").unwrap()];
+        assert_eq!(
+            guard.lines().map(str::trim).collect::<Vec<_>>(),
+            [
+                "chain guard {",
+                "type filter hook prerouting priority raw; policy accept;",
+                "iifname \"tap0\" ip6 daddr { fd76:6d6b:6974::/64, fe80::/10 } ip6 daddr != fd76:6d6b:6974::1 drop",
+            ]
+        );
+    }
+
     #[test]
     fn restricted_ipv6_denies_every_special_range_but_not_global_unicast() {
         let denied = |a: &str| {
@@ -668,7 +781,7 @@ mod tests {
     #[test]
     fn ipv6_destinations_have_their_own_sets() {
         let r = ruleset(
-            &NetSpec::default(),
+            &v6(),
             &["192.168.5.15/32".parse().unwrap(), "3ffe:0:0:1::/64".parse().unwrap()],
         );
         let set = |name: &str| {
@@ -699,7 +812,7 @@ mod tests {
                 &NetSpec {
                     egress,
                     allow: allow.iter().map(|a| a.parse().unwrap()).collect(),
-                    ..NetSpec::default()
+                    ..v6()
                 },
                 &[],
             )
@@ -722,19 +835,19 @@ mod tests {
 
     #[test]
     fn ipv6_from_the_guest_is_policed_like_ipv4() {
-        let r = ruleset(&NetSpec::default(), &[]);
+        let r = ruleset(&v6(), &[]);
         let at = |needle: &str| r.find(needle).unwrap_or_else(|| panic!("{needle} missing:\n{r}"));
         assert!(!r.contains("meta nfproto ipv6 drop"), "{r}");
         assert!(at("iifname \"tap0\" ip6 saddr != fd76:6d6b:6974::2 drop") < at("ct state established,related accept"));
         assert!(at("oifname \"egress0\" ip6 daddr @allow6 accept") < at("oifname \"egress0\" ip6 daddr @deny6 drop"));
         assert!(at("ip6 daddr @deny6 drop") < at("iifname \"tap0\" oifname \"egress0\" accept"));
         // A bare namespace still drops IPv6.
-        assert!(egress_ruleset(&NetSpec::default(), &[]).contains("meta nfproto ipv6 drop"));
+        assert!(egress_ruleset(&v6(), &[]).contains("meta nfproto ipv6 drop"));
     }
 
     #[test]
     fn only_the_guests_neighbour_solicitations_reach_the_namespace() {
-        let r = ruleset(&NetSpec::default(), &[]);
+        let r = ruleset(&v6(), &[]);
         let input = &r[r.find("chain input {").unwrap()..];
         let input = &input[..input.find("  }").unwrap()];
         assert_eq!(
@@ -817,28 +930,28 @@ mod tests {
             r.contains("iifname != \"tap0\" fib daddr type local tcp dport 8443 dnat ip to 172.30.0.2:443"),
             "{r}"
         );
-        let args = pasta_args(&spec, true);
+        let args = pasta_args(&spec);
         let all =
             |flag: &str| -> Vec<String> { args.windows(2).filter(|w| w[0] == flag).map(|w| w[1].clone()).collect() };
         // One spec per forward, each bound to its own address.
         assert_eq!(all("--tcp-ports"), ["127.0.0.1/8080", "192.168.5.15/8443"]);
         assert_eq!(all("--udp-ports"), ["0.0.0.0/5353"]);
         assert_eq!(all("--tcp-ns"), ["none"]);
-        let none = pasta_args(&NetSpec::default(), true);
+        let none = pasta_args(&NetSpec::default());
         let flags = |flag: &str| -> Vec<&String> { none.windows(2).filter(|w| w[0] == flag).map(|w| &w[1]).collect() };
         assert_eq!(flags("--tcp-ports"), ["none"]);
         assert_eq!(flags("--udp-ports"), ["none"]);
     }
 
     #[test]
-    fn pasta_is_dual_stack_for_the_tap_network_only() {
-        let tap = pasta_args(&NetSpec::default(), true);
+    fn pasta_is_dual_stack_only_with_ipv6() {
+        let tap = pasta_args(&v6());
         assert!(!tap.contains(&"--ipv4-only".to_string()), "{tap:?}");
         assert!(
             tap.contains(&"--no-ra".to_string()) && tap.contains(&"--no-dhcpv6".to_string()),
             "{tap:?}"
         );
-        let bare = pasta_args(&NetSpec::default(), false);
+        let bare = pasta_args(&NetSpec::default());
         assert!(bare.contains(&"--ipv4-only".to_string()), "{bare:?}");
         assert!(!bare.contains(&"--no-ra".to_string()), "{bare:?}");
         for args in [&tap, &bare] {
@@ -944,19 +1057,33 @@ garbage
 ";
         let got: Vec<String> = host_prefixes6(routes).iter().map(Cidr::to_string).collect();
         // Not the default routes, the route through a gateway (2a01::/32), or the rejects
-        // (unreachable 2000::/3, and the prefix route of an address on lo).
-        assert_eq!(
-            got,
-            [
-                "3ffe:0:0:1::/64",
-                "fe80::/64",
-                "::1/128",
-                "3ffe::7/128",
-                "3ffe:0:0:1::1/128",
-                "ff00::/8"
-            ]
-        );
+        // (unreachable 2000::/3, and the prefix route of an address on lo). Each is widened
+        // to its /56, the usual end-site allocation, so the host's neighbouring subnets (the
+        // rest of a cloud VPC, a home's other LANs) are denied too.
+        assert_eq!(got, ["3ffe::/56", "fe80::/56", "::/56", "ff00::/8"]);
         assert!(host_prefixes6("").is_empty());
+    }
+
+    #[test]
+    fn pastas_copied_ipv6_addresses_are_the_default_route_devices() {
+        // pasta copies the addresses of the interface on the default route, whatever a more
+        // specific route (here `unreachable 2000::/3`) would do with a given destination.
+        let routes = "\
+20000000000000000000000000000000 03 00000000000000000000000000000000 00 00000000000000000000000000000000 00001000 00000001 00000000 00200200       lo
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 3ffe00000000000100000000000000fe 00001000 00000001 00000000 00000003    vmkt6
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00002000 00000001 00000000 00000003     eth1
+";
+        let addresses = "\
+3ffe0000000000010000000000000001 05 40 00 80    vmkt6
+fe8000000000000000c302fffe76291b 05 40 20 80    vmkt6
+3ffe0000000000000000000000000007 01 80 00 80       lo
+2a010000000000000000000000000005 06 40 00 80     eth1
+";
+        assert_eq!(
+            default_route_addresses6(routes, addresses),
+            ["3ffe:0:0:1::1".parse::<Ipv6Addr>().unwrap()]
+        );
+        assert!(default_route_addresses6("", addresses).is_empty());
     }
 
     #[test]

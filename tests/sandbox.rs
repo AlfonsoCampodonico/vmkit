@@ -297,11 +297,24 @@ fn the_network_namespace_gets_the_tap_and_pasta() {
 }
 
 #[test]
+fn without_ipv6_the_tap_has_no_ipv6_side() {
+    let Some(s) = Sandbox::new() else { return };
+    let mut spec = s.spec(&["ip", "-6", "-o", "addr", "show", "dev", "tap0"]);
+    spec.network = Network::Tap(NetSpec::default());
+    let o = s.output(&spec);
+    assert!(o.status.success(), "{o:?}");
+    assert!(!stdout(&o).contains("fd76:"), "{}", stdout(&o));
+}
+
+#[test]
 fn the_tap_has_the_ipv6_gateway_and_a_permanent_neighbour_for_the_guest() {
     let Some(s) = Sandbox::new() else { return };
     let run = |args: &[&str]| {
         let mut spec = s.spec(args);
-        spec.network = Network::Tap(NetSpec::default());
+        spec.network = Network::Tap(NetSpec {
+            ipv6: true,
+            ..NetSpec::default()
+        });
         let o = s.output(&spec);
         assert!(o.status.success(), "{o:?}");
         stdout(&o)
@@ -329,7 +342,10 @@ fn the_tap_has_the_ipv6_gateway_and_a_permanent_neighbour_for_the_guest() {
     spec.root = Root::Host;
     spec.command.program = Program::Path(BUSYBOX.into());
     spec.mounts.clear();
-    spec.network = Network::Tap(NetSpec::default());
+    spec.network = Network::Tap(NetSpec {
+        ipv6: true,
+        ..NetSpec::default()
+    });
     let o = s.output(&spec);
     assert!(o.status.success(), "{o:?}");
     assert_eq!(stdout(&o), "1\n0\n0\n");

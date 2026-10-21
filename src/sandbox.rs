@@ -372,6 +372,9 @@ pub struct Policy {
     /// `pasta` and its options; the helper adds the namespace to attach to.
     pub pasta: PathBuf,
     pub pasta_args: Vec<String>,
+    /// Give the tap its IPv6 side (the spec asked for it and the host has IPv6).
+    #[serde(default)]
+    pub ipv6: bool,
 }
 
 /// What the helper sets up in the network namespace.
@@ -551,10 +554,21 @@ pub(crate) fn vmm_spec(spec: &VmSpec, vmm: &Path, args: &[String], extra: &[Moun
 
 /// The policy half of a network plan: the ruleset for the host's current addresses and IPv6
 /// prefixes. An `allow` entry that is only an address pasta copies is refused
-/// ([`NetSpec::check_allow`]).
-fn policy(n: &NetSpec, ruleset: fn(&NetSpec, &[Cidr]) -> String, ipv6: bool) -> Result<Policy> {
+/// ([`NetSpec::check_allow`]). IPv6 is on only with a tap, when the spec asks for it and the
+/// host has IPv6; otherwise the namespace stays IPv4-only, as it was before IPv6.
+fn policy(n: &NetSpec, ruleset: fn(&NetSpec, &[Cidr]) -> String, tap: bool) -> Result<Policy> {
+    let n = &NetSpec {
+        ipv6: tap && n.ipv6 && net::host_has_ipv6(),
+        ..n.clone()
+    };
     let copied: Vec<IpAddr> = (net::outbound_address().map(IpAddr::V4).into_iter())
-        .chain(net::outbound_address6().map(IpAddr::V6))
+        .chain(
+            n.ipv6
+                .then(net::outbound_addresses6)
+                .into_iter()
+                .flatten()
+                .map(IpAddr::V6),
+        )
         .collect();
     n.check_allow(&copied).map_err(Error::InvalidSpec)?;
     // A host without IPv6 has no `ipv6_route`.
@@ -571,7 +585,8 @@ fn policy(n: &NetSpec, ruleset: fn(&NetSpec, &[Cidr]) -> String, ipv6: bool) -> 
         nft: binary::find_system("nft")?,
         ruleset: ruleset(n, &host),
         pasta: binary::find("pasta", "VMKIT_PASTA")?,
-        pasta_args: net::pasta_args(n, ipv6),
+        pasta_args: net::pasta_args(n),
+        ipv6: n.ipv6,
     })
 }
 
@@ -1004,6 +1019,7 @@ mod tests {
                     ruleset: "table inet vmkit {}".into(),
                     pasta: "/bin/pasta".into(),
                     pasta_args: vec!["--quiet".into()],
+                    ipv6: true,
                 }),
             }),
         };

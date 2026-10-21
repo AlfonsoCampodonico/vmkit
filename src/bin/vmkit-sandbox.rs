@@ -376,38 +376,45 @@ mod linux {
             None,
         );
         tool(ip, &["addr", "add", &gateway, "dev", TAP], None);
-        // Usable at once: the guest's duplicate address detection never reaches the namespace.
-        let gateway6 = format!("{GATEWAY6}/{PREFIX6}");
-        tool(ip, &["-6", "addr", "add", &gateway6, "dev", TAP, "nodad"], None);
-        // All apply to this namespace only. `route_localnet` lets a forwarded connection that
-        // pasta spliced from host loopback leave through the tap after DNAT. The tap takes no
-        // router advertisement or redirect from the guest, even if forwarding were off.
+        // Both apply to this namespace only. `route_localnet` lets a forwarded connection that
+        // pasta spliced from host loopback leave through the tap after DNAT.
         let sysctl =
             |path: &str, value: &str| fs::write(path, value).unwrap_or_else(|e| fail(&format!("writing {path}"), e));
         sysctl("/proc/sys/net/ipv4/ip_forward", "1");
         sysctl(&format!("/proc/sys/net/ipv4/conf/{TAP}/route_localnet"), "1");
-        sysctl("/proc/sys/net/ipv6/conf/all/forwarding", "1");
-        sysctl(&format!("/proc/sys/net/ipv6/conf/{TAP}/accept_ra"), "0");
-        sysctl(&format!("/proc/sys/net/ipv6/conf/{TAP}/accept_redirects"), "0");
+        // The tap's IPv6 side, unless the namespace has IPv6 off (a host whose namespaces
+        // inherit `disable_ipv6`): then the guest's IPv6 goes nowhere.
+        let ipv6 = net.ipv6
+            && fs::read_to_string(format!("/proc/sys/net/ipv6/conf/{TAP}/disable_ipv6")).is_ok_and(|v| v.trim() == "0");
+        if ipv6 {
+            // Usable at once: the guest's duplicate address detection never reaches the namespace.
+            let gateway6 = format!("{GATEWAY6}/{PREFIX6}");
+            tool(ip, &["-6", "addr", "add", &gateway6, "dev", TAP, "nodad"], None);
+            // The tap takes no router advertisement or redirect from the guest, even if
+            // forwarding were off.
+            sysctl("/proc/sys/net/ipv6/conf/all/forwarding", "1");
+            sysctl(&format!("/proc/sys/net/ipv6/conf/{TAP}/accept_ra"), "0");
+            sysctl(&format!("/proc/sys/net/ipv6/conf/{TAP}/accept_redirects"), "0");
+        }
         tool(ip, &["link", "set", TAP, "up"], None);
-        // The guest's neighbour entry is fixed, never learned from the guest. Bringing the link
-        // up would flush it, the VMM opening the tap does not.
-        tool(
-            ip,
-            &[
+        if ipv6 {
+            // The guest's neighbour entry is fixed, never learned from the guest. Bringing the
+            // link up would flush it, the VMM opening the tap does not.
+            let guest6 = GUEST6.to_string();
+            let neigh = [
                 "-6",
                 "neigh",
                 "replace",
-                &GUEST6.to_string(),
+                &guest6,
                 "lladdr",
                 GUEST_MAC,
                 "dev",
                 TAP,
                 "nud",
                 "permanent",
-            ],
-            None,
-        );
+            ];
+            tool(ip, &neigh, None);
+        }
         tool(&net.nft, &["-f", "-"], Some(&net.ruleset));
     }
 

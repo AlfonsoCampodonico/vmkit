@@ -67,7 +67,7 @@ fn net_spec(c: &Case, net: NetSpec, extra: &[String]) -> VmSpec {
     spec.cmdline.push(format!("vmkit.ip6={GUEST6}/{PREFIX6}"));
     spec.cmdline.push(format!("vmkit.gw6={GATEWAY6}"));
     spec.cmdline.extend(extra.iter().cloned());
-    spec.net = Some(net);
+    spec.net = Some(NetSpec { ipv6: true, ..net });
     spec
 }
 
