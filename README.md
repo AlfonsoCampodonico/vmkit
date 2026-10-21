@@ -455,6 +455,7 @@ Hosted arm64 runners have no KVM, so the aarch64 kernel is boot-tested by hand a
 | `tests/contract.rs` | KVM, both VMMs, `VMKIT_TEST_KERNEL`, `VMKIT_TEST_INITRAMFS` | on both backends: boot and exit method, reset backstop, panic, kill, disk order, writes to sector 0, device budget, guest-initiated vsock, symlinked disks refused, a run directory with a comma, the sandbox's contents and privileges |
 | `tests/network.rs` | as contract, plus `testguest/net-fixture.sh` and `VMKIT_TEST_NET=1` | the hostile guest: metadata, private and host addresses, the gateway, other VMs and spoofed sources are unreachable; allowed destinations, DNS and port forwards work; an `allow` entry for the outbound address is refused; a host port in use fails with `pasta`'s message |
 | `tests/pause.rs` | as contract | pause stops the guest, resume continues it |
+| `tests/snapshot.rs` | as contract | snapshot and restore (local and lazy) continue the guest with its memory, disk and new vsock connections; a bundle restores twice and is never written; foreign, tampered and lazily corrupted bundles are refused |
 
 Without their variables the Linux suites skip each test; `VMKIT_REQUIRE_KVM_TESTS=1` turns a skip into a failure.
 
@@ -479,6 +480,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, clippy and the unit te
 Notes:
 
 - Pause and resume run alone: Cloud Hypervisor 53 on aarch64 can leave a guest stuck after a resume while other VMs load the host. That was reproduced with plain `ch-remote` under nested virtualization; Firecracker is unaffected.
+- The snapshot suite runs alone too. On aarch64 under nested virtualization, a Cloud Hypervisor 53 guest restored from a snapshot does not run after `resume`: it printed nothing for a minute. That was reproduced with plain `cloud-hypervisor` and `ch-remote`, with no vmkit involved. The Cloud Hypervisor restore tests are judged on x86_64, where they pass; the bundle checks pass on both. A `Copy` restore there also takes seconds to minutes.
 - Keep the contract suite's `--test-threads` at about half the CPUs; under heavier load, Cloud Hypervisor guests also stalled occasionally on the same nested setup.
 - A failing test prints the end of the guest console. Each VM's run directory also holds the VMM's own log.
 - `testguest/smoke.sh <kernel> <initramfs>` boots the test guest once on each VMM without vmkit, to check a kernel and initramfs on their own.
