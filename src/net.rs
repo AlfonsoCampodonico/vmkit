@@ -645,7 +645,13 @@ mod tests {
             let err = attach(tap, "02:00:0a:00:00:05").check().unwrap_err();
             assert!(err.contains("tap"), "{tap:?}: {err}");
         }
-        for mac in ["01:00:00:00:00:01", "02:00:0a:00:00", "zz:00:0a:00:00:05", "02-00-0a-00-00-05", ""] {
+        for mac in [
+            "01:00:00:00:00:01",
+            "02:00:0a:00:00",
+            "zz:00:0a:00:00:05",
+            "02-00-0a-00-00-05",
+            "",
+        ] {
             let err = attach("kiln0", mac).check().unwrap_err();
             assert!(err.contains("MAC"), "{mac:?}: {err}");
         }

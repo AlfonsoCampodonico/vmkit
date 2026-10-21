@@ -479,13 +479,19 @@ mod tests {
         let mut s = spec();
         assert_eq!(net_config(&s), None);
         s.net = Some(NetSpec::default());
-        assert_eq!(net_config(&s), Some(json!([{"tap": "tap0", "mac": "06:00:ac:1e:00:02"}])));
+        assert_eq!(
+            net_config(&s),
+            Some(json!([{"tap": "tap0", "mac": "06:00:ac:1e:00:02"}]))
+        );
         s.net = None;
         s.tap = Some(crate::net::TapAttach {
             tap: "kiln0".into(),
             mac: "0a:58:0a:f4:01:05".into(),
         });
-        assert_eq!(net_config(&s), Some(json!([{"tap": "kiln0", "mac": "0a:58:0a:f4:01:05"}])));
+        assert_eq!(
+            net_config(&s),
+            Some(json!([{"tap": "kiln0", "mac": "0a:58:0a:f4:01:05"}]))
+        );
         assert!(rules(&s).contains(&("/dev/net/tun".into(), "rw".into())));
     }
 }

@@ -346,7 +346,10 @@ mod tests {
         let mut s = spec(29);
         s.tap = Some(kiln0());
         assert_eq!(s.devices_needed(), 31, "29 disks + vsock + the tap");
-        assert!(matches!(s.check(&CAPS), Err(crate::Error::TooManyDevices { requested: 31, .. })));
+        assert!(matches!(
+            s.check(&CAPS),
+            Err(crate::Error::TooManyDevices { requested: 31, .. })
+        ));
         let mut s = spec(1);
         s.tap = Some(kiln0());
         assert!(s.check(&CAPS).is_ok());
