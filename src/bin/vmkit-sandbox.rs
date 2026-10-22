@@ -48,7 +48,7 @@ mod linux {
         set_capabilities, set_no_new_privs, set_thread_groups, set_thread_res_gid, set_thread_res_uid,
     };
     use vmkit::net::{GATEWAY, GATEWAY6, GUEST_MAC, GUEST6, PREFIX, PREFIX6, TAP};
-    use vmkit::sandbox::{Mount, NetKind, NetPlan, Plan, Policy, Program, Root, SubidPlan};
+    use vmkit::sandbox::{Mount, NetKind, NetPlan, Network, Plan, Policy, Program, Root, SubidPlan};
 
     /// The capabilities `init` needs inside the user namespace: mounts and pivot_root,
     /// then the net namespace's tap and nftables. They reach `init` (and `pasta`) across
@@ -553,7 +553,13 @@ mod linux {
         let plan = read_plan(plan_path);
         // The library checked the spec; a plan file is checked again before it is trusted.
         plan.spec.check().unwrap_or_else(|e| fail("the plan", e));
-        unshare(UnshareFlags::NEWNS | UnshareFlags::NEWNET | UnshareFlags::NEWIPC | UnshareFlags::NEWUTS);
+        // An attached tap lives in the caller's network namespace, so the program stays there;
+        // it holds no capability over that namespace (it is owned by another user namespace).
+        let mut flags = UnshareFlags::NEWNS | UnshareFlags::NEWIPC | UnshareFlags::NEWUTS;
+        if plan.spec.network != Network::Attached {
+            flags |= UnshareFlags::NEWNET;
+        }
+        unshare(flags);
         match &plan.net {
             Some(NetPlan {
                 ip,

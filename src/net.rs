@@ -210,6 +210,46 @@ pub struct NetSpec {
     pub ipv6: bool,
 }
 
+/// A NIC on a tap that already exists in the caller's network namespace, for a caller that
+/// set up the namespace itself (a containerd shim attaching a VM to a CNI pod netns). The
+/// VMM stays in that namespace instead of getting one of its own; it opens the tap by name,
+/// which needs the tap to be owned by the caller's uid. vmkit creates nothing: no tap, no
+/// policy and no `pasta`. Whatever polices the guest is the caller's (kiln-shim spec §3.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TapAttach {
+    /// The tap's interface name in the caller's namespace.
+    pub tap: String,
+    /// The guest NIC's MAC address, `xx:xx:xx:xx:xx:xx` (usually the pod interface's).
+    pub mac: String,
+}
+
+impl TapAttach {
+    /// Rejects a name Linux cannot hold as an interface and a MAC that is not unicast.
+    pub fn check(&self) -> Result<(), String> {
+        let name_ok = (1..=15).contains(&self.tap.len())
+            && self
+                .tap
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+        if !name_ok {
+            return Err(format!(
+                "tap {:?} is not an interface name (1-15 of A-Z, a-z, 0-9, _ . -)",
+                self.tap
+            ));
+        }
+        let octets: Vec<&str> = self.mac.split(':').collect();
+        let hex = octets.len() == 6
+            && octets
+                .iter()
+                .all(|o| o.len() == 2 && o.bytes().all(|b| b.is_ascii_hexdigit()));
+        let unicast = hex && u8::from_str_radix(octets[0], 16).is_ok_and(|b| b & 1 == 0);
+        if !unicast {
+            return Err(format!("MAC {:?} is not a unicast xx:xx:xx:xx:xx:xx address", self.mac));
+        }
+        Ok(())
+    }
+}
+
 impl NetSpec {
     /// Rejects forwards the namespace cannot hold: port 0, or a host port used twice. A
     /// port is used twice even on two addresses: the namespace sees only the port.
@@ -589,6 +629,33 @@ pub(crate) fn host_addresses(fib_trie: &str) -> Vec<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn attach(tap: &str, mac: &str) -> TapAttach {
+        TapAttach {
+            tap: tap.into(),
+            mac: mac.into(),
+        }
+    }
+
+    #[test]
+    fn an_attached_tap_has_a_valid_name_and_a_unicast_mac() {
+        assert_eq!(attach("kiln0", "02:00:0a:00:00:05").check(), Ok(()));
+        assert_eq!(attach("tap_1.a-b", "0A:58:0A:F4:01:05").check(), Ok(()));
+        for tap in ["", "sixteen-bytes-xx", "a/b", "a b", "a:b"] {
+            let err = attach(tap, "02:00:0a:00:00:05").check().unwrap_err();
+            assert!(err.contains("tap"), "{tap:?}: {err}");
+        }
+        for mac in [
+            "01:00:00:00:00:01",
+            "02:00:0a:00:00",
+            "zz:00:0a:00:00:05",
+            "02-00-0a-00-00-05",
+            "",
+        ] {
+            let err = attach("kiln0", mac).check().unwrap_err();
+            assert!(err.contains("MAC"), "{mac:?}: {err}");
+        }
+    }
 
     #[test]
     fn the_egress_ruleset_polices_the_namespaces_own_traffic() {

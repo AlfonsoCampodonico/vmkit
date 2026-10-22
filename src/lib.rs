@@ -26,7 +26,7 @@ pub use bundle::{BUNDLE_FILE, BUNDLE_VERSION, BundleInfo, BundleVsock, DiskInfo,
 pub use cloud_hypervisor::CloudHypervisor;
 pub use error::{Error, Result};
 pub use firecracker::Firecracker;
-pub use net::NetSpec;
+pub use net::{NetSpec, TapAttach};
 pub use sandbox::cgroups_available;
 pub use spec::{
     Capabilities, Disk, EndReason, GuestExit, RestoreDisk, RestoreSpec, SnapshotBundle, VmEnd, VmSpec, VsockSpec,

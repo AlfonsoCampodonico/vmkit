@@ -258,6 +258,15 @@ flowchart LR
 - Each `PortForward { protocol, address, host, guest }` names the host address `pasta` listens on (`127.0.0.1` keeps it to this host, `0.0.0.0` listens on every address). A host port can be forwarded once per protocol, whatever its addresses, because the namespace sees only the port. Ports below 1024 cannot be forwarded by an unprivileged `pasta` unless the host lowers `net.ipv4.ip_unprivileged_port_start`; creating the VM then fails with `pasta`'s message.
 - The guest kernel is built without netfilter: the policy lives outside the VM.
 
+#### Attaching to a caller's tap (`TapAttach`)
+
+`VmSpec.tap = Some(TapAttach { tap, mac })` is the other way to give a VM a NIC, for a caller that owns a network namespace already (kiln's containerd shim, in a CNI pod netns). A VM has `net` or `tap`, not both.
+- The VMM stays in the **caller's** network namespace instead of getting one of its own (`sandbox::Network::Attached`), and opens the tap `tap` by name, with the guest MAC `mac`.
+- vmkit creates nothing there: the caller makes the tap, owned by its uid (so the VMM may open it without capabilities), and whatever polices the guest (the shim's tc filters). There is no nftables policy and no `pasta`.
+- The VMM holds no capability over that namespace (it belongs to another user namespace), so it cannot change its addresses, routes or filters; unlike a VMM in its own namespace, it can open sockets there.
+- One VM at a time can hold a tap: a second open fails with `EBUSY`.
+- A VM on an attached tap is never snapshotted (`Error::Unsupported`): a bundle cannot record the caller's tap.
+
 ### Isolation layers
 
 What surrounds a sandboxed process, outermost first; VMMs and general programs share the layers but differ in the innermost one.
@@ -460,6 +469,7 @@ Hosted arm64 runners have no KVM, so the aarch64 kernel is boot-tested by hand a
 | `tests/network.rs` | as contract, plus `testguest/net-fixture.sh` and `VMKIT_TEST_NET=1` | the hostile guest, over IPv4 and IPv6: metadata, private and host addresses, the gateway, other VMs and spoofed sources are unreachable; allowed destinations, DNS and port forwards work; an `allow` entry for the outbound address is refused; a host port in use fails with `pasta`'s message |
 | `tests/pause.rs` | as contract | pause stops the guest, resume continues it |
 | `tests/snapshot.rs` | as contract | snapshot and restore (local and lazy) continue the guest with its memory, disk and new vsock connections; a bundle restores twice and is never written; foreign, tampered and lazily corrupted bundles are refused |
+| `tests/attach.rs` | as contract, run inside the namespace `testguest/attach-fixture.sh` makes (sudo), with `VMKIT_TEST_ATTACH=1` | on both backends: a VM on an attached tap reaches the caller's namespace |
 
 Without their variables the Linux suites skip each test; `VMKIT_REQUIRE_KVM_TESTS=1` turns a skip into a failure.
 

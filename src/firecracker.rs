@@ -236,15 +236,21 @@ impl FirecrackerVm {
             self.call("PUT", "/vsock", json!({"guest_cid": v.guest_cid, "uds_path": inside}))?;
             self.vsock = Some(uds);
         }
-        if spec.net.is_some() {
-            self.call(
-                "PUT",
-                "/network-interfaces/eth0",
-                json!({"iface_id": "eth0", "host_dev_name": net::TAP, "guest_mac": net::GUEST_MAC}),
-            )?;
+        if let Some(nic) = network_interface(spec) {
+            self.call("PUT", "/network-interfaces/eth0", nic)?;
         }
         Ok(())
     }
+}
+
+/// The `eth0` body: vmkit's own tap in the VM's namespace, or the caller's attached one.
+fn network_interface(spec: &VmSpec) -> Option<Value> {
+    let (tap, mac) = match (&spec.net, &spec.tap) {
+        (Some(_), _) => (net::TAP, net::GUEST_MAC),
+        (None, Some(t)) => (t.tap.as_str(), t.mac.as_str()),
+        (None, None) => return None,
+    };
+    Some(json!({"iface_id": "eth0", "host_dev_name": tap, "guest_mac": mac}))
 }
 
 impl Vm for FirecrackerVm {
@@ -273,6 +279,7 @@ impl Vm for FirecrackerVm {
     }
 
     fn snapshot(&mut self, dest: &Path) -> Result<SnapshotBundle> {
+        self.shape.check_snapshot()?;
         bundle::prepare_dest(dest)?;
         self.pause()?;
         let made = self.shape.vmm_dir()?;
@@ -293,5 +300,46 @@ impl Drop for FirecrackerVm {
     fn drop(&mut self) {
         let _ = self.proc.kill();
         let _ = self.proc.wait(Some(Duration::from_secs(5)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> VmSpec {
+        VmSpec {
+            kernel: "/k/vmlinux".into(),
+            initramfs: None,
+            cmdline: Vec::new(),
+            disks: Vec::new(),
+            vcpus: 1,
+            memory_mib: 128,
+            vsock: None,
+            net: None,
+            tap: None,
+            console_log: "/run/vm/console.log".into(),
+            run_dir: "/run/vm".into(),
+        }
+    }
+
+    #[test]
+    fn the_nic_is_vmkits_tap_or_the_attached_one() {
+        let mut s = spec();
+        assert_eq!(network_interface(&s), None);
+        s.net = Some(net::NetSpec::default());
+        assert_eq!(
+            network_interface(&s),
+            Some(json!({"iface_id": "eth0", "host_dev_name": "tap0", "guest_mac": "06:00:ac:1e:00:02"}))
+        );
+        s.net = None;
+        s.tap = Some(net::TapAttach {
+            tap: "kiln0".into(),
+            mac: "0a:58:0a:f4:01:05".into(),
+        });
+        assert_eq!(
+            network_interface(&s),
+            Some(json!({"iface_id": "eth0", "host_dev_name": "kiln0", "guest_mac": "0a:58:0a:f4:01:05"}))
+        );
     }
 }
