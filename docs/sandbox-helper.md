@@ -6,6 +6,8 @@
 vmkit-sandbox run <plan.json>      outer stage: user + PID namespaces, attaches pasta, waits for the program
 vmkit-sandbox userns <plan.json>   for subordinate ids: the user namespace that run maps from outside
 vmkit-sandbox init <plan.json>     PID 1: mount, net, IPC and UTS namespaces, then the program
+vmkit-sandbox nft <pid> <parent> <nft>
+                                   after start: nft -f - in the user and net namespaces of PID 1 <pid>
 ```
 
 ## The plan
@@ -98,3 +100,13 @@ Before exec, the program's process sets its user (if given), its working directo
 ### Nested user namespace
 
 With `nest`, the forked program unshares a user namespace and `init` writes its maps from outside, mapping every id of the sandbox unchanged (`0 0 1` and `1 1 <count>`). The program then sets `max_user_namespaces` to 0 inside its own namespace. It is root over its files but has no capability over the sandbox's mount and network namespaces, and `init` is undumpable, so the program cannot trace it.
+
+## nft (Vm::set_egress)
+
+A short-lived stage the library runs while a VM is up, with the `nft` script on stdin (`net::egress_script`: flush the `forward` chain of `table inet vmkit` and refill it, one transaction). It is not part of a sandbox's start and needs no plan.
+
+1. Marks inherited descriptors close-on-exec and makes itself undumpable.
+2. Opens a pidfd for `<pid>` (the VMM, from `<run_dir>/vmm.pid`), then checks that its parent is still `<parent>` (the outer helper the library started), so a stale or reused PID is refused. The namespaces entered are the pidfd's, so they belong to the process that was checked.
+3. `setns(pidfd, CLONE_NEWUSER | CLONE_NEWNET)`. The user namespace was created by the same user, so the stage holds every capability in it, and none over the host. The mount and PID namespaces are not entered: `<nft>` is the host's, and nothing in the sandbox can see this process.
+4. Raises `CAP_NET_ADMIN` as an ambient capability and execs `<nft> -f -`.
+
