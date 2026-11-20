@@ -11,7 +11,7 @@ use crate::bundle::{self, Expect, Layout, VmmId};
 use crate::ch_config;
 use crate::error::{Error, Result};
 use crate::events;
-use crate::net;
+use crate::net::{self, EgressGate};
 use crate::process::Proc;
 use crate::sandbox::{self, Mount};
 use crate::snapshot::{self, Restore, Shape};
@@ -391,6 +391,10 @@ impl Vm for ChVm {
 
     fn vsock_socket(&self) -> Option<&Path> {
         self.vsock.as_deref()
+    }
+
+    fn set_egress(&mut self, gate: EgressGate) -> Result<()> {
+        self.proc.set_egress(gate)
     }
 }
 

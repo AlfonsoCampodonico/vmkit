@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::binary;
 use crate::error::{Error, Result};
-use crate::net::{self, Cidr, NetSpec};
+use crate::net::{self, Cidr, EgressGate, NetSpec};
 use crate::process::{self, Proc};
 use crate::spec::VmSpec;
 use crate::subid;
@@ -704,6 +704,83 @@ pub fn spawn(spec: &Spec, stdio: Stdio) -> Result<Sandbox> {
 
 /// Starts `vmm` with in-sandbox `args` under the sandbox `helper` for `spec`. Guest serial is
 /// appended to `spec.console_log`; the VMM's and the helper's stderr go to `stderr_log`.
+/// How long `nft` may take to switch a VM's egress.
+const EGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What [`crate::Vm::set_egress`] needs for a VM with a network of vmkit's own: the helper,
+/// `nft`, and the VM's [`NetSpec`] as its namespace's ruleset was made from it.
+#[derive(Debug, Clone)]
+pub(crate) struct EgressControl {
+    helper: PathBuf,
+    nft: PathBuf,
+    spec: NetSpec,
+}
+
+/// The egress control for a VMM sandbox planned as `plan`, or why it has none.
+fn egress_control(helper: &Path, plan: &Plan) -> std::result::Result<EgressControl, &'static str> {
+    match (&plan.spec.network, &plan.net) {
+        (
+            Network::Tap(n),
+            Some(NetPlan {
+                kind: NetKind::Tap(policy),
+                ..
+            }),
+        ) => Ok(EgressControl {
+            helper: helper.to_path_buf(),
+            nft: policy.nft.clone(),
+            // The ruleset was made with the IPv6 the host has, not only the one asked for.
+            spec: NetSpec {
+                ipv6: policy.ipv6,
+                ..n.clone()
+            },
+        }),
+        (Network::Attached, _) => Err("its NIC is an attached tap, whose caller owns the policy"),
+        _ => Err("it has no NIC"),
+    }
+}
+
+impl EgressControl {
+    /// Switches the namespace of the sandbox whose PID 1 is `vmm` (the child of the outer
+    /// helper `parent`) to `gate`, with `vmkit-sandbox nft` and one `nft -f -` transaction.
+    pub(crate) fn apply(&self, vmm: i32, parent: u32, gate: EgressGate) -> Result<()> {
+        use std::io::{Read, Write};
+        let failed = |why: String| Error::EgressFailed(why);
+        let mut child = std::process::Command::new(&self.helper)
+            .arg("nft")
+            .arg(vmm.to_string())
+            .arg(parent.to_string())
+            .arg(&self.nft)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            // A helper that failed before reading leaves a broken pipe; its status says why.
+            let _ = stdin.write_all(net::egress_script(&self.spec, gate).as_bytes());
+        }
+        let deadline = std::time::Instant::now() + EGRESS_TIMEOUT;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(failed(format!("nft did not finish in {EGRESS_TIMEOUT:?}")));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        if status.success() {
+            return Ok(());
+        }
+        let mut message = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut message);
+        }
+        Err(failed(format!("{status}: {}", message.trim())))
+    }
+}
+
 pub(crate) fn spawn_vmm(
     helper: &Path,
     vmm: &Path,
@@ -716,7 +793,9 @@ pub(crate) fn spawn_vmm(
     let plan = plan(&sandbox)?;
     let path = write_plan(&plan)?;
     let (program, args) = launcher(helper, &path, sandbox.limits.cgroup.as_ref());
-    process::spawn(&program, &args, &spec.console_log, stderr_log).map(|p| p.with_vmm_pid_file(&plan.pid_file))
+    let egress = egress_control(helper, &plan);
+    process::spawn(&program, &args, &spec.console_log, stderr_log)
+        .map(|p| p.with_vmm_pid_file(&plan.pid_file).with_egress(egress))
 }
 
 #[cfg(test)]
@@ -1049,5 +1128,56 @@ mod tests {
         };
         let back: Plan = serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
         assert_eq!(back, plan);
+    }
+
+    #[test]
+    fn only_a_vm_with_its_own_network_can_switch_its_egress() {
+        let plan_for = |s: &VmSpec, net: Option<NetPlan>| Plan {
+            spec: vmm_spec(s, Path::new("/bin/vmm"), &[], &[]),
+            root: "/run/vm/sandbox-root".into(),
+            pid_file: "/run/vm/vmm.pid".into(),
+            subid: None,
+            net,
+        };
+        let helper = Path::new("/usr/local/bin/vmkit-sandbox");
+        assert_eq!(
+            egress_control(helper, &plan_for(&spec(), None)).unwrap_err(),
+            "it has no NIC"
+        );
+        let mut attached = spec();
+        attached.tap = Some(net::TapAttach {
+            tap: "kiln0".into(),
+            mac: "02:00:0a:00:00:05".into(),
+        });
+        let e = egress_control(helper, &plan_for(&attached, None)).unwrap_err();
+        assert!(e.contains("attached tap"), "{e}");
+
+        // The control keeps the spec as the namespace has it: IPv6 only if the host had it.
+        let mut own = spec();
+        own.net = Some(NetSpec {
+            egress: net::Egress::DenyAll,
+            ipv6: true,
+            ..NetSpec::default()
+        });
+        let policy = Policy {
+            nft: "/usr/sbin/nft".into(),
+            ruleset: String::new(),
+            pasta: "/usr/bin/pasta".into(),
+            pasta_args: Vec::new(),
+            ipv6: false,
+        };
+        let plan = plan_for(
+            &own,
+            Some(NetPlan {
+                ip: "/usr/sbin/ip".into(),
+                kind: NetKind::Tap(policy),
+            }),
+        );
+        let c = egress_control(helper, &plan).unwrap();
+        assert_eq!(
+            (c.helper.as_path(), c.nft.as_path()),
+            (helper, Path::new("/usr/sbin/nft"))
+        );
+        assert_eq!((c.spec.egress, c.spec.ipv6), (net::Egress::DenyAll, false));
     }
 }
