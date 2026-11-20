@@ -9,6 +9,9 @@
 #   vmkit.spoof=<addr/len>   then probe the IPv4 targets again from this unassigned source address
 #   vmkit.spoof6=<addr/len>  and the IPv6 targets from this one
 #   vmkit.serve=<port>       serve HTTP on this port ("VMKIT-SERVED"), then wait for vmkit.hold=<seconds>
+#   vmkit.rounds=<n> vmkit.knock=<port>  then n more rounds of the probes and DNS, labelled
+#                            tcp-<round> and VMKIT-DNS-<round>, each once the host has connected
+#                            to <port> (and read "VMKIT-KNOCK <round>")
 #   vmkit.mark=<word>        with vmkit.test=count: written to sector 0 of vda, if there is one
 #   vmkit.vsock=<port>       with vmkit.test=count: try a vsock connection to the host each tick
 /bin/busybox mount -t proc proc /proc
@@ -16,7 +19,7 @@
 /bin/busybox mount -t devtmpfs dev /dev
 action=up
 method=poweroff
-ip= gw= ip6= gw6= probes= names= spoof= spoof6= serve= hold=0 mark=1 vport=
+ip= gw= ip6= gw6= probes= names= spoof= spoof6= serve= hold=0 mark=1 vport= rounds=0 knock=
 for arg in $(/bin/busybox cat /proc/cmdline); do
   case $arg in
     vmkit.test=*) action=${arg#vmkit.test=} ;;
@@ -33,6 +36,8 @@ for arg in $(/bin/busybox cat /proc/cmdline); do
     vmkit.hold=*) hold=${arg#vmkit.hold=} ;;
     vmkit.mark=*) mark=${arg#vmkit.mark=} ;;
     vmkit.vsock=*) vport=${arg#vmkit.vsock=} ;;
+    vmkit.rounds=*) rounds=${arg#vmkit.rounds=} ;;
+    vmkit.knock=*) knock=${arg#vmkit.knock=} ;;
   esac
 done
 probe() { # probe <label> <ip:port>|<[ipv6]:port>
@@ -83,6 +88,18 @@ case $action in
     for n in $names; do
       if /bin/busybox nslookup "$n" "$gw" >/dev/null 2>&1; then r=ok; else r=fail; fi
       echo "VMKIT-DNS $n $r"
+    done
+    round=1
+    while [ "$round" -le "$rounds" ]; do
+      echo "VMKIT-KNOCK-WAIT $round"
+      echo "VMKIT-KNOCK $round" | /bin/busybox nc -l -p "$knock" >/dev/null 2>&1
+      for p in $probes; do probe "tcp-$round" "$p"; done
+      for n in $names; do
+        if /bin/busybox nslookup "$n" "$gw" >/dev/null 2>&1; then r=ok; else r=fail; fi
+        echo "VMKIT-DNS-$round $n $r"
+      done
+      echo "VMKIT-ROUND-DONE $round"
+      round=$((round+1))
     done
     if [ -n "$spoof" ]; then
       # Send from an address the host did not assign (the route's preferred source).

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use common::{Case, END};
 use vmkit::net::{Cidr, Egress, GATEWAY, GATEWAY6, GUEST, GUEST6, PREFIX, PREFIX6, PortForward, Protocol};
-use vmkit::{Backend, NetSpec, Vm, VmSpec};
+use vmkit::{Backend, EgressGate, NetSpec, Vm, VmSpec};
 
 const METADATA: &str = "169.254.169.254";
 const PRIVATE: &str = "10.250.0.1";
@@ -90,7 +90,12 @@ fn verdict(c: &Case, kind: &str, target: &str) -> String {
 }
 
 fn dns(c: &Case, name: &str) -> String {
-    let prefix = format!("VMKIT-DNS {name} ");
+    dns_labelled(c, "VMKIT-DNS", name)
+}
+
+/// A DNS result under `label` (`VMKIT-DNS`, or `VMKIT-DNS-<round>` for a later round).
+fn dns_labelled(c: &Case, label: &str, name: &str) -> String {
+    let prefix = format!("{label} {name} ");
     c.console()
         .lines()
         .find_map(|l| l.trim().strip_prefix(&prefix).map(String::from))
@@ -261,6 +266,106 @@ fn a_forward_bound_to_loopback_is_reachable_only_there(backend: Backend) {
     vm.wait_timeout(END).unwrap().expect("killed");
 }
 
+/// Connects to the guest's knock listener through `addr` until it answers for `round`, which
+/// starts that round of probes.
+fn knock(addr: &str, round: u32) {
+    let want = format!("VMKIT-KNOCK {round}");
+    let deadline = Instant::now() + END;
+    loop {
+        let attempt = TcpStream::connect(addr).and_then(|mut s| {
+            s.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut text = String::new();
+            s.read_to_string(&mut text)?;
+            Ok(text)
+        });
+        match attempt {
+            Ok(text) if text.contains(&want) => return,
+            other => assert!(Instant::now() < deadline, "knock {round} at {addr}: {other:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// kiln's build steps: one VM whose egress is closed and reopened while it runs.
+fn egress_closes_and_reopens_at_runtime(backend: Backend) {
+    let Some(c) = net_case(backend) else { return };
+    let port = listener();
+    let knock_port = free_port();
+    let net = NetSpec {
+        // The knocks come in through pasta's interface, so forwards are shown to work while closed.
+        forwards: vec![PortForward {
+            protocol: Protocol::Tcp,
+            address: Ipv4Addr::UNSPECIFIED,
+            host: knock_port,
+            guest: 7000,
+        }],
+        // Restricted denies the host's addresses: reaching them shows the allow list is back.
+        allow: vec![HOST.parse::<Cidr>().unwrap(), HOST6.parse::<Cidr>().unwrap()],
+        ..NetSpec::default()
+    };
+    let gates = [
+        EgressGate::Closed,
+        EgressGate::Policy,
+        EgressGate::Closed,
+        EgressGate::Policy,
+    ];
+    let mut extra = probes(&[HOST, HOST6], port);
+    extra.push("vmkit.dns=localhost".into());
+    extra.push(format!("vmkit.rounds={}", gates.len()));
+    extra.push("vmkit.knock=7000".into());
+    let mut vm: Box<dyn Vm> = c.vmm.create(&net_spec(&c, net, &extra)).expect("create");
+    // Before start the namespace exists already: the gate can be set (and reset) then too.
+    vm.set_egress(EgressGate::Closed).expect("close before start");
+    vm.set_egress(EgressGate::Policy).expect("reopen before start");
+    vm.start().expect("start");
+    c.await_console("VMKIT-KNOCK-WAIT 1", 1);
+    // Round 0, at boot under the VM's own policy: the allowed addresses and DNS.
+    for target in [HOST, HOST6] {
+        assert_eq!(verdict(&c, "tcp", &at(target, port)), "open", "{target}");
+    }
+    assert_eq!(dns(&c, "localhost"), "ok");
+    for (i, gate) in gates.into_iter().enumerate() {
+        let round = i as u32 + 1;
+        vm.set_egress(gate).expect("set_egress");
+        // Idempotent: setting the same gate again changes nothing.
+        vm.set_egress(gate).expect("set_egress again");
+        knock(&format!("{HOST}:{knock_port}"), round);
+        c.await_console(&format!("VMKIT-ROUND-DONE {round}"), 1);
+        let (want, dns_want) = match gate {
+            EgressGate::Closed => ("closed", "fail"),
+            EgressGate::Policy => ("open", "ok"),
+        };
+        for target in [HOST, HOST6] {
+            assert_eq!(
+                verdict(&c, &format!("tcp-{round}"), &at(target, port)),
+                want,
+                "round {round} ({gate:?}): {target}"
+            );
+        }
+        assert_eq!(
+            dns_labelled(&c, &format!("VMKIT-DNS-{round}"), "localhost"),
+            dns_want,
+            "round {round} ({gate:?}): DNS"
+        );
+    }
+    vm.wait_timeout(END)
+        .unwrap()
+        .unwrap_or_else(|| panic!("VM did not end; console tail:\n{}", c.tail()));
+    let err = vm.set_egress(EgressGate::Closed).expect_err("the VM has ended");
+    assert!(matches!(err, vmkit::Error::EgressFailed(_)), "{err}");
+}
+
+/// Only a VM with a network of vmkit's own has an egress to set.
+fn a_vm_without_its_own_network_has_no_egress_to_set(backend: Backend) {
+    let Some(c) = net_case(backend) else { return };
+    let mut vm: Box<dyn Vm> = c.vmm.create(&c.spec("up")).expect("create");
+    let err = vm.set_egress(EgressGate::Closed).expect_err("no NIC");
+    assert!(
+        matches!(&err, vmkit::Error::EgressUnavailable(m) if m.contains("no NIC")),
+        "{err}"
+    );
+}
+
 /// pasta copies the host's outbound address into the namespace, so an exception for it
 /// alone could never work: refused. (The fixture addresses on `lo` are not copied: the
 /// allow cases above reach them.)
@@ -352,4 +457,6 @@ network!(
     a_host_port_in_use_fails_with_pastas_message,
     a_forward_bound_to_loopback_is_reachable_only_there,
     an_allow_entry_for_the_hosts_outbound_address_is_refused,
+    egress_closes_and_reopens_at_runtime,
+    a_vm_without_its_own_network_has_no_egress_to_set,
 );
