@@ -182,10 +182,10 @@ pub enum EgressGate {
     /// starts so.
     #[default]
     Policy,
-    /// The guest opens no new connection through its namespace at all: no TCP, UDP or ICMP
-    /// to any destination, and no DNS (the gateway's DNS is refused too). Traffic of
-    /// connections that already exist (established or related) still flows both ways, and
-    /// port forwards still reach the guest.
+    /// Nothing the guest sends gets through its namespace: no new connection (TCP, UDP or
+    /// ICMP, to any destination, `allow` entries included), no DNS (the gateway's DNS is
+    /// refused too), and no packet of a connection the guest opened while egress was open.
+    /// Port forwards still reach the guest, and its replies on them still get out.
     Closed,
 }
 
@@ -398,10 +398,11 @@ pub fn egress_ruleset(spec: &NetSpec, host: &[Cidr]) -> String {
 }
 
 /// The rules of the VM namespace's `forward` chain (`policy drop`), which polices everything
-/// the guest sends through the namespace. With [`EgressGate::Closed`] one rule more, right
-/// after the one that accepts established and related traffic, drops everything else from
-/// the tap: every new connection, including DNS (DNAT'd to [`DNS_FORWARD`] in `prerouting`,
-/// so it is forwarded too) and what `ct status dnat accept` would otherwise let through.
+/// the guest sends through the namespace. With [`EgressGate::Closed`] two rules more, before
+/// the one that accepts established and related traffic, let through from the tap only the
+/// guest's replies on port-forwarded connections (DNAT'd, in the reply direction) and drop
+/// everything else: new connections, connections the guest opened while egress was open, and
+/// DNS (DNAT'd to [`DNS_FORWARD`] in `prerouting`, but in the original direction, from the guest).
 fn forward_rules(spec: &NetSpec, gate: EgressGate) -> Vec<String> {
     let mut rules = vec![format!("iifname \"{TAP}\" ip saddr != {GUEST} drop")];
     if spec.ipv6 {
@@ -409,10 +410,11 @@ fn forward_rules(spec: &NetSpec, gate: EgressGate) -> Vec<String> {
     } else {
         rules.push(format!("iifname \"{TAP}\" meta nfproto ipv6 drop"));
     }
-    rules.push("ct state established,related accept".into());
     if gate == EgressGate::Closed {
+        rules.push(format!("iifname \"{TAP}\" ct status dnat ct direction reply accept"));
         rules.push(format!("iifname \"{TAP}\" drop"));
     }
+    rules.push("ct state established,related accept".into());
     rules.push("ct status dnat accept".into());
     rules.push(format!("iifname \"{TAP}\" oifname \"{EGRESS}\" ip daddr @allow accept"));
     rules.push(format!("iifname \"{TAP}\" oifname \"{EGRESS}\" ip daddr @deny drop"));
@@ -1059,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_egress_drops_every_new_packet_from_the_tap_dns_included() {
+    fn closed_egress_drops_everything_from_the_tap_but_replies_on_forwards() {
         for ipv6 in [false, true] {
             let spec = NetSpec {
                 ipv6,
@@ -1073,34 +1075,30 @@ mod tests {
                     .position(|r| r == rule)
                     .unwrap_or_else(|| panic!("{rule}: {closed:?}"))
             };
-            // One rule more: established and related traffic still flows, then everything
-            // else from the tap is dropped before anything could accept it, including the
-            // DNAT'd DNS (`ct status dnat accept`) and the allow set.
-            assert_eq!(closed.len(), open.len() + 1, "{closed:?}");
+            // Two rules more, ahead of the established/related accept: connections the guest
+            // opened while egress was open are cut too. Only replies on connections into the
+            // guest (port forwards, DNAT'd in the original direction) pass. DNS is DNAT'd as
+            // well, but its packets from the guest are in the original direction: dropped.
+            assert_eq!(closed.len(), open.len() + 2, "{closed:?}");
+            let replies = at("iifname \"tap0\" ct status dnat ct direction reply accept");
             let drop = at("iifname \"tap0\" drop");
-            assert_eq!(drop, at("ct state established,related accept") + 1);
+            assert_eq!(drop, replies + 1);
+            assert!(drop < at("ct state established,related accept"));
             assert!(drop < at("ct status dnat accept"));
             assert!(drop < at("iifname \"tap0\" oifname \"egress0\" ip daddr @allow accept"));
             assert_eq!(
-                closed
-                    .iter()
-                    .filter(|r| *r != "iifname \"tap0\" drop")
-                    .collect::<Vec<_>>(),
+                closed[..replies].iter().chain(&closed[drop + 1..]).collect::<Vec<_>>(),
                 open.iter().collect::<Vec<_>>()
             );
             // The spoofing guards still come first.
-            assert!(at(&format!("iifname \"tap0\" ip saddr != {GUEST} drop")) < drop);
+            assert!(at(&format!("iifname \"tap0\" ip saddr != {GUEST} drop")) < replies);
             // DNS reaches pasta through the forward chain: it is DNAT'd to an address
             // outside the namespace, not answered by the namespace itself.
             let r = ruleset(&spec, &[]);
-            assert!(
-                r.contains(&format!("ip daddr {GATEWAY} udp dport 53 dnat ip to {DNS_FORWARD}")),
-                "{r}"
-            );
-            assert!(
-                r.contains(&format!("ip daddr {GATEWAY} tcp dport 53 dnat ip to {DNS_FORWARD}")),
-                "{r}"
-            );
+            for proto in ["udp", "tcp"] {
+                let dnat = format!("ip daddr {GATEWAY} {proto} dport 53 dnat ip to {DNS_FORWARD}");
+                assert!(r.contains(&dnat), "{r}");
+            }
         }
         // Applying a script twice is the same as once: it always starts from an empty chain.
         let spec = NetSpec::default();

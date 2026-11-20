@@ -286,6 +286,25 @@ fn knock(addr: &str, round: u32) {
     }
 }
 
+/// A host listener that takes one connection and counts the lines it reads.
+fn stream_listener() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::BufRead;
+    let l = TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let lines = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = lines.clone();
+    std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        for line in std::io::BufReader::new(s).lines() {
+            match line {
+                Ok(_) => count.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                Err(_) => break,
+            };
+        }
+    });
+    (port, lines)
+}
+
 /// kiln's build steps: one VM whose egress is closed and reopened while it runs.
 fn egress_closes_and_reopens_at_runtime(backend: Backend) {
     let Some(c) = net_case(backend) else { return };
@@ -309,7 +328,11 @@ fn egress_closes_and_reopens_at_runtime(backend: Backend) {
         EgressGate::Closed,
         EgressGate::Policy,
     ];
+    // A connection the guest opens while egress is open, and keeps writing to.
+    let (stream_port, streamed) = stream_listener();
+    let lines = || streamed.load(std::sync::atomic::Ordering::SeqCst);
     let mut extra = probes(&[HOST, HOST6], port);
+    extra.push(format!("vmkit.stream={}", at(HOST, stream_port)));
     extra.push("vmkit.dns=localhost".into());
     extra.push(format!("vmkit.rounds={}", gates.len()));
     extra.push("vmkit.knock=7000".into());
@@ -324,11 +347,24 @@ fn egress_closes_and_reopens_at_runtime(backend: Backend) {
         assert_eq!(verdict(&c, "tcp", &at(target, port)), "open", "{target}");
     }
     assert_eq!(dns(&c, "localhost"), "ok");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while lines() < 5 {
+        assert!(Instant::now() < deadline, "the guest's stream sent {} lines", lines());
+        std::thread::sleep(Duration::from_millis(100));
+    }
     for (i, gate) in gates.into_iter().enumerate() {
         let round = i as u32 + 1;
         vm.set_egress(gate).expect("set_egress");
         // Idempotent: setting the same gate again changes nothing.
         vm.set_egress(gate).expect("set_egress again");
+        if round == 1 {
+            // Closing cuts the connection the guest opened while egress was open: once what
+            // was in flight has arrived, nothing more does, though the guest keeps writing.
+            std::thread::sleep(Duration::from_secs(1));
+            let before = lines();
+            std::thread::sleep(Duration::from_secs(3));
+            assert_eq!(lines(), before, "the guest's stream still got through a closed gate");
+        }
         knock(&format!("{HOST}:{knock_port}"), round);
         c.await_console(&format!("VMKIT-ROUND-DONE {round}"), 1);
         let (want, dns_want) = match gate {

@@ -12,6 +12,8 @@
 #   vmkit.rounds=<n> vmkit.knock=<port>  then n more rounds of the probes and DNS, labelled
 #                            tcp-<round> and VMKIT-DNS-<round>, each once the host has connected
 #                            to <port> (and read "VMKIT-KNOCK <round>")
+#   vmkit.stream=<ip>:<port> before the probes, keep one TCP connection open to it, writing a
+#                            numbered line every 0.2 s (IPv4)
 #   vmkit.mark=<word>        with vmkit.test=count: written to sector 0 of vda, if there is one
 #   vmkit.vsock=<port>       with vmkit.test=count: try a vsock connection to the host each tick
 /bin/busybox mount -t proc proc /proc
@@ -19,7 +21,7 @@
 /bin/busybox mount -t devtmpfs dev /dev
 action=up
 method=poweroff
-ip= gw= ip6= gw6= probes= names= spoof= spoof6= serve= hold=0 mark=1 vport= rounds=0 knock=
+ip= gw= ip6= gw6= probes= names= spoof= spoof6= serve= hold=0 mark=1 vport= rounds=0 knock= stream=
 for arg in $(/bin/busybox cat /proc/cmdline); do
   case $arg in
     vmkit.test=*) action=${arg#vmkit.test=} ;;
@@ -38,6 +40,7 @@ for arg in $(/bin/busybox cat /proc/cmdline); do
     vmkit.vsock=*) vport=${arg#vmkit.vsock=} ;;
     vmkit.rounds=*) rounds=${arg#vmkit.rounds=} ;;
     vmkit.knock=*) knock=${arg#vmkit.knock=} ;;
+    vmkit.stream=*) stream=${arg#vmkit.stream=} ;;
   esac
 done
 probe() { # probe <label> <ip:port>|<[ipv6]:port>
@@ -83,6 +86,10 @@ case $action in
     if [ -n "$serve" ]; then
       /bin/busybox mkdir -p /srv && echo VMKIT-SERVED > /srv/index.html
       /bin/busybox httpd -p "$serve" -h /srv && echo "VMKIT-SERVING $serve"
+    fi
+    if [ -n "$stream" ]; then
+      (i=0; while :; do i=$((i+1)); echo "VMKIT-STREAM $i"; /bin/busybox sleep 0.2; done) \
+        | /bin/busybox nc "${stream%:*}" "${stream##*:}" >/dev/null 2>&1 &
     fi
     for p in $probes; do probe tcp "$p"; done
     for n in $names; do
