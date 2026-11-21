@@ -1,0 +1,33 @@
+--- a/kernel/reboot.c
++++ b/kernel/reboot.c
+@@ -229,6 +229,21 @@
+ }
+ EXPORT_SYMBOL(unregister_restart_handler);
+ 
++/*
++ * vmkit: "vmkit.reset=poweroff" turns every restart (reboot(2), a panic with
++ * panic=-1, emergency_restart()) into a power-off. Apple's Virtualization.framework
++ * reboots a guest in place without telling the host, so a guest reset must end
++ * the VM some other way.
++ */
++static bool reset_poweroff __ro_after_init;
++
++static int __init vmkit_reset_setup(char *str)
++{
++	reset_poweroff = !strcmp(str, "poweroff");
++	return 1;
++}
++__setup("vmkit.reset=", vmkit_reset_setup);
++
+ /**
+  *	do_kernel_restart - Execute kernel restart handler call chain
+  *
+@@ -245,6 +260,8 @@
+  */
+ void do_kernel_restart(char *cmd)
+ {
++	if (reset_poweroff)
++		do_kernel_power_off();
+ 	atomic_notifier_call_chain(&restart_handler_list, reboot_mode, cmd);
+ }
+ 

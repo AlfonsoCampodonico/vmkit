@@ -465,7 +465,9 @@ export VMKIT_TEST_KERNEL=~/out/vmlinux-<version>-aarch64 VMKIT_TEST_INITRAMFS=~/
 kernels/build.sh aarch64 out     # or x86_64 (cross-compiles when needed)
 ```
 
-The build checks the source tarball and the base config against `kernels/SHA256SUMS`, uses fixed build metadata so the output is reproducible, and fails if any fragment line did not survive `olddefconfig`. It writes `vmlinux-<version>-<arch>` and `config-<version>-<arch>`.
+vmkit's own kernel patches are in `kernels/patches/`. Each is opt-in through a kernel argument, so it changes nothing unless a caller passes that argument. Today there is one: `vmkit.reset=poweroff` turns any guest restart into a power-off, for backends that reboot a guest in place (`kernels/patches/README.md`).
+
+The build checks the source tarball and the base config against `kernels/SHA256SUMS`, applies the patches, uses fixed build metadata so the output is reproducible, and fails if any fragment line did not survive `olddefconfig`. It writes `vmlinux-<version>-<arch>` and `config-<version>-<arch>`.
 
 Tagging `kernels-<version>` builds both arches, boot-tests x86_64 on both VMMs, and publishes release assets and `ghcr.io/<owner>/vmkit-kernels/base:<version>-<arch>` (`.github/workflows/kernels.yml`). The ghcr package starts private; make it public in the package settings if kiln users should pull it anonymously.
 
