@@ -60,6 +60,9 @@ pub struct Capabilities {
     pub max_virtio_devices: u32,
     /// Devices the backend always adds itself (Cloud Hypervisor's RNG).
     pub implicit_devices: u32,
+    /// Whether `Vm::snapshot` and `Vmm::restore` work at all. When false they fail with
+    /// [`crate::Error::Unsupported`].
+    pub supports_snapshot: bool,
     pub supports_diff_snapshot: bool,
     pub supports_balloon: bool,
     pub supports_drive_remap: bool,
@@ -253,6 +256,7 @@ mod tests {
     const CAPS: Capabilities = Capabilities {
         max_virtio_devices: 31,
         implicit_devices: 1,
+        supports_snapshot: true,
         supports_diff_snapshot: false,
         supports_balloon: true,
         supports_drive_remap: false,

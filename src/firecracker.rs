@@ -132,6 +132,7 @@ impl Vmm for Firecracker {
         Capabilities {
             max_virtio_devices: if self.arch == "aarch64" { 92 } else { 17 },
             implicit_devices: 0,
+            supports_snapshot: true,
             supports_diff_snapshot: true,
             supports_balloon: true,
             supports_drive_remap: true,

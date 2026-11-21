@@ -198,6 +198,7 @@ impl Vmm for CloudHypervisor {
         Capabilities {
             max_virtio_devices: 31,
             implicit_devices: 1,
+            supports_snapshot: true,
             supports_diff_snapshot: false,
             supports_balloon: true,
             supports_drive_remap: false,

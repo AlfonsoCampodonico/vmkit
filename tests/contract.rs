@@ -1,7 +1,10 @@
-//! The vmkit contract suite (kiln spec §11.3): every test runs against both backends.
+//! The vmkit contract suite (kiln spec §11.3): every test runs against both Linux backends,
+//! and on macOS against Apple VZ, except the test of the Linux sandbox.
 //!
-//! Needs KVM, the VMM binaries, and a test kernel and guest:
+//! Needs KVM and the VMM binaries (Linux) or the signed `vmkit-vz` helper (macOS, `VMKIT_VZ`
+//! or `PATH`), and a test kernel and guest:
 //!   VMKIT_TEST_KERNEL=<vmlinux or Image>  VMKIT_TEST_INITRAMFS=<initramfs.cpio.gz>
+//! On macOS the kernel is an aarch64 `Image` with the `vmkit.reset=poweroff` patch.
 //! Without them each test is skipped, unless VMKIT_REQUIRE_KVM_TESTS=1 makes that a failure.
 //! Pause and resume live in `tests/pause.rs`, which runs alone.
 
@@ -25,13 +28,24 @@ fn boots_and_ends_with_the_exit_method(backend: Backend) {
     );
 }
 
+/// How a guest reset ends the VM: Firecracker exits on it, Cloud Hypervisor's backstop stops
+/// the VMM, and on Apple VZ the kernel's `vmkit.reset=poweroff` turns it into a power-off.
+fn reset_end(backend: Backend, c: &Case) -> EndReason {
+    #[cfg(target_os = "macos")]
+    if backend == Backend::AppleVz {
+        return EndReason::Exited;
+    }
+    let _ = backend;
+    match c.vmm.capabilities().guest_exit {
+        GuestExit::Reboot => EndReason::Exited,
+        GuestExit::Poweroff => EndReason::ResetStopped,
+    }
+}
+
 fn a_guest_reset_ends_the_vm_once(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
     let (_vm, end) = c.run(&c.spec("reboot"));
-    let expected = match c.vmm.capabilities().guest_exit {
-        GuestExit::Reboot => EndReason::Exited,
-        GuestExit::Poweroff => EndReason::ResetStopped,
-    };
+    let expected = reset_end(backend, &c);
     assert_eq!(end.reason, expected, "{end:?}");
     // The workload must never run twice (kiln spec §4.1 backstop).
     std::thread::sleep(Duration::from_millis(500));
@@ -41,11 +55,9 @@ fn a_guest_reset_ends_the_vm_once(backend: Backend) {
 fn a_panic_ends_the_vm(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
     // Both a panic and PID 1 exiting make the guest reset: Firecracker exits on it
-    // (`reboot=k`), and Cloud Hypervisor's backstop stops the VMM. Never a plain kill.
-    let expected = match c.vmm.capabilities().guest_exit {
-        GuestExit::Reboot => EndReason::Exited,
-        GuestExit::Poweroff => EndReason::ResetStopped,
-    };
+    // (`reboot=k`), Cloud Hypervisor's backstop stops the VMM, and the VZ guest powers off.
+    // Never a plain kill.
+    let expected = reset_end(backend, &c);
     for action in ["panic", "exit"] {
         let (_vm, end) = c.run(&c.spec(action));
         assert_eq!(end.reason, expected, "{action}: {end:?}");
@@ -198,6 +210,7 @@ fn a_run_dir_with_a_comma_boots(backend: Backend) {
 }
 
 /// Every path under `dir`, relative to it, without descending into `/vm/sock`.
+#[cfg(target_os = "linux")]
 fn walk(dir: &std::path::Path, rel: &str, out: &mut Vec<String>) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let entry = entry.unwrap();
@@ -209,6 +222,7 @@ fn walk(dir: &std::path::Path, rel: &str, out: &mut Vec<String>) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn status_field(status: &str, field: &str) -> String {
     status
         .lines()
@@ -218,6 +232,7 @@ fn status_field(status: &str, field: &str) -> String {
         .to_string()
 }
 
+#[cfg(target_os = "linux")]
 fn the_vmm_sees_only_its_own_files_and_holds_no_privileges(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
     let mut spec = c.spec("idle");
@@ -287,6 +302,7 @@ fn the_vmm_sees_only_its_own_files_and_holds_no_privileges(backend: Backend) {
 }
 
 /// The invoking user's uid, from `/proc/self/status`.
+#[cfg(target_os = "linux")]
 fn rustix_free_uid() -> String {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     status_field(&status, "Uid")
@@ -296,27 +312,65 @@ fn rustix_free_uid() -> String {
         .to_string()
 }
 
+/// The Apple VZ backend's own: what a Linux backend does with a NIC, egress and snapshots
+/// has no VZ counterpart, and says so.
+#[cfg(target_os = "macos")]
+fn no_network_and_no_snapshots(backend: Backend) {
+    let Some(c) = Case::new(backend) else { return };
+    let caps = c.vmm.capabilities();
+    assert!(!caps.supports_snapshot);
+    let mut spec = c.spec("idle");
+    spec.net = Some(vmkit::NetSpec::default());
+    let err = c.vmm.create(&spec).err().expect("no NIC on apple-vz");
+    assert!(matches!(err, Error::Unsupported(_)), "{err}");
+    spec.net = None;
+    let mut vm = c.vmm.create(&spec).unwrap();
+    vm.start().unwrap();
+    c.await_console("VMKIT-GUEST-TICK", 1);
+    let err = vm.set_egress(vmkit::EgressGate::Closed).unwrap_err();
+    assert!(matches!(err, Error::EgressUnavailable(_)), "{err}");
+    let err = vm.snapshot(&c.dir.path().join("snap")).unwrap_err();
+    assert!(matches!(err, Error::Unsupported(_)), "{err}");
+    assert!(!c.dir.path().join("snap").exists());
+    vm.kill().unwrap();
+    assert_eq!(vm.wait().unwrap().reason, EndReason::Killed);
+}
+
+/// `linux` tests run on Firecracker and Cloud Hypervisor; `all` tests also on Apple VZ (macOS),
+/// with `vz` the Apple VZ backend's own.
 macro_rules! contract {
-    ($($name:ident),* $(,)?) => {
+    (linux: [$($linux:ident),* $(,)?], all: [$($all:ident),* $(,)?], vz: [$($vz:ident),* $(,)?] $(,)?) => {
+        #[cfg(target_os = "linux")]
         mod firecracker {
-            $( #[test] fn $name() { super::$name(vmkit::Backend::Firecracker) } )*
+            $( #[test] fn $linux() { super::$linux(vmkit::Backend::Firecracker) } )*
+            $( #[test] fn $all() { super::$all(vmkit::Backend::Firecracker) } )*
         }
+        #[cfg(target_os = "linux")]
         mod cloud_hypervisor {
-            $( #[test] fn $name() { super::$name(vmkit::Backend::CloudHypervisor) } )*
+            $( #[test] fn $linux() { super::$linux(vmkit::Backend::CloudHypervisor) } )*
+            $( #[test] fn $all() { super::$all(vmkit::Backend::CloudHypervisor) } )*
+        }
+        #[cfg(target_os = "macos")]
+        mod apple_vz {
+            $( #[test] fn $all() { super::$all(vmkit::Backend::AppleVz) } )*
+            $( #[test] fn $vz() { super::$vz(vmkit::Backend::AppleVz) } )*
         }
     };
 }
 
 contract!(
-    boots_and_ends_with_the_exit_method,
-    a_guest_reset_ends_the_vm_once,
-    a_panic_ends_the_vm,
-    kill_ends_the_vmm_and_its_api,
-    disks_attach_in_order,
-    a_guest_can_write_sector_0_of_a_writable_disk,
-    device_budget_is_enforced_before_any_vmm_starts,
-    guest_vsock_connections_reach_the_host_socket,
-    the_vmm_sees_only_its_own_files_and_holds_no_privileges,
-    a_symlinked_disk_is_refused,
-    a_run_dir_with_a_comma_boots,
+    linux: [the_vmm_sees_only_its_own_files_and_holds_no_privileges],
+    all: [
+        boots_and_ends_with_the_exit_method,
+        a_guest_reset_ends_the_vm_once,
+        a_panic_ends_the_vm,
+        kill_ends_the_vmm_and_its_api,
+        disks_attach_in_order,
+        a_guest_can_write_sector_0_of_a_writable_disk,
+        device_budget_is_enforced_before_any_vmm_starts,
+        guest_vsock_connections_reach_the_host_socket,
+        a_symlinked_disk_is_refused,
+        a_run_dir_with_a_comma_boots,
+    ],
+    vz: [no_network_and_no_snapshots],
 );
