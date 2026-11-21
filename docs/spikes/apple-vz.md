@@ -186,7 +186,7 @@ Hypervisor are unaffected. The VZ backend appends the argument as one of "its
 backend's own parameters" (kiln spec §8.3).
 
 Checked with `spike/vmkit-vz/resettest.sh`, on the test initramfs with
-`vmkit.reset=poweroff`. The patched build's sha256 is `ca49e968…`.
+`vmkit.reset=poweroff`. The CI build of the patched kernel is `ba0b5832…`, now in `kernels/tested-aarch64.sha256`. It also passes the aarch64 contract and pause suites on Firecracker and Cloud Hypervisor.
 
 | guest action | unpatched kernel, 10 s | patched kernel |
 |---|---|---|
