@@ -4,6 +4,9 @@
 //!   vmkit-sandbox run <plan.json>      outer: user + PID namespaces, attaches pasta, waits for the program
 //!   vmkit-sandbox userns <plan.json>   for subordinate ids: the user namespace `run` maps from outside
 //!   vmkit-sandbox init <plan.json>     inner (PID 1): mount, net, IPC and UTS namespaces, then the program
+//!   vmkit-sandbox nft <pid> <parent> <nft>
+//!                                      after start: `nft -f -` in the user and net namespaces of the
+//!                                      sandbox's PID 1 `pid`, if it is still the child of `parent`
 //!
 //! Stages talk over a socket on the later stage's stdin. `userns` sends `unshared` once its
 //! user namespace exists and waits for `mapped`, which `run` sends after `newuidmap` and
@@ -71,8 +74,58 @@ mod linux {
             (Some("run"), Some(plan)) => run(plan),
             (Some("userns"), Some(plan)) => userns(plan),
             (Some("init"), Some(plan)) => init(plan),
-            _ => fail("usage", "vmkit-sandbox run|userns|init <plan.json>"),
+            (Some("nft"), Some(pid)) if args.len() == 5 => enter_and_nft(pid, &args[3], Path::new(&args[4])),
+            _ => fail(
+                "usage",
+                "vmkit-sandbox run|userns|init <plan.json> | vmkit-sandbox nft <pid> <parent> <nft>",
+            ),
         }
+    }
+
+    /// Runs `nft -f -` (the script on stdin) in the user and network namespaces of `pid`, the
+    /// PID 1 of a running sandbox, which must still be the child of `parent` (the outer
+    /// helper the library started): a stale PID, or one reused by any other process, is
+    /// refused. The namespaces are entered through a pidfd opened before that check, so both
+    /// belong to the process that was checked. The same user created that user namespace, so
+    /// this process holds every capability in it once inside; `nft` gets `CAP_NET_ADMIN` there
+    /// as an ambient capability, and nothing over the host.
+    /// The mount and PID namespaces are not entered: `nft` is the host's, and the sandbox
+    /// cannot see this process.
+    fn enter_and_nft(pid: &str, parent: &str, nft: &Path) -> ! {
+        use rustix::process::{Pid, PidfdFlags, pidfd_open};
+        use rustix::thread::{ThreadNameSpaceType, move_into_thread_name_spaces};
+        close_inherited_fds();
+        // Nothing in the sandbox may trace this process once it shares the sandbox's namespaces.
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+            .unwrap_or_else(|e| fail("making the helper undumpable", e));
+        let pid: i32 = pid.parse().unwrap_or_else(|e| fail("the sandbox's pid", e));
+        let parent: u32 = parent.parse().unwrap_or_else(|e| fail("the helper's pid", e));
+        let fd = Pid::from_raw(pid)
+            .ok_or("not a pid")
+            .and_then(|p| pidfd_open(p, PidfdFlags::empty()).map_err(|_| "it is not running"))
+            .unwrap_or_else(|e| fail("the sandbox", e));
+        // Checked after opening the pidfd, so the namespaces entered are the checked process's.
+        let actual = fs::read_to_string(format!("/proc/{pid}/status")).ok().and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("PPid:"))
+                .and_then(|v| v.trim().parse::<u32>().ok())
+        });
+        if actual != Some(parent) {
+            fail(
+                "the sandbox",
+                "it is no longer running (its pid is not the helper's child)",
+            );
+        }
+        move_into_thread_name_spaces(fd.as_fd(), ThreadNameSpaceType::USER | ThreadNameSpaceType::NETWORK)
+            .unwrap_or_else(|e| fail("entering the sandbox's namespaces", e));
+        drop(fd);
+        let mut caps = capabilities(None).unwrap_or_else(|e| fail("reading capabilities", e));
+        caps.inheritable = CapabilitySet::NET_ADMIN;
+        set_capabilities(None, caps).unwrap_or_else(|e| fail("setting inheritable capabilities", e));
+        configure_capability_in_ambient_set(CapabilitySet::NET_ADMIN, true)
+            .unwrap_or_else(|e| fail("raising an ambient capability", e));
+        let err = Command::new(nft).args(["-f", "-"]).exec();
+        fail(&format!("exec {}", nft.display()), err)
     }
 
     /// Unshares namespaces. This process is single-threaded and does not share its

@@ -168,6 +168,27 @@ pub enum Egress {
     Open,
 }
 
+/// Whether the VM's egress policy is in force or every new connection from the guest is
+/// refused, switched at runtime with [`crate::Vm::set_egress`] (kiln's build steps with and
+/// without network, in one VM).
+///
+/// It is a separate type from [`Egress`] on purpose: `Egress` is the policy a VM is created
+/// with (which destinations are reachable), and `Closed` is not a policy but a gate in front
+/// of it. Closing and reopening never changes the policy, so [`EgressGate::Policy`] always
+/// restores exactly the VM's own [`NetSpec::egress`] and [`NetSpec::allow`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum EgressGate {
+    /// The VM's own policy applies ([`NetSpec::egress`], [`NetSpec::allow`]). Every VM
+    /// starts so.
+    #[default]
+    Policy,
+    /// Nothing the guest sends gets through its namespace: no new connection (TCP, UDP or
+    /// ICMP, to any destination, `allow` entries included), no DNS (the gateway's DNS is
+    /// refused too), and no packet of a connection the guest opened while egress was open.
+    /// Port forwards still reach the guest, and its replies on them still get out.
+    Closed,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Protocol {
     Tcp,
@@ -376,6 +397,52 @@ pub fn egress_ruleset(spec: &NetSpec, host: &[Cidr]) -> String {
     )
 }
 
+/// The rules of the VM namespace's `forward` chain (`policy drop`), which polices everything
+/// the guest sends through the namespace. With [`EgressGate::Closed`] two rules more, before
+/// the one that accepts established and related traffic, let through from the tap only the
+/// guest's replies on port-forwarded connections (DNAT'd, in the reply direction) and drop
+/// everything else: new connections, connections the guest opened while egress was open, and
+/// DNS (DNAT'd to [`DNS_FORWARD`] in `prerouting`, but in the original direction, from the guest).
+fn forward_rules(spec: &NetSpec, gate: EgressGate) -> Vec<String> {
+    let mut rules = vec![format!("iifname \"{TAP}\" ip saddr != {GUEST} drop")];
+    if spec.ipv6 {
+        rules.push(format!("iifname \"{TAP}\" ip6 saddr != {GUEST6} drop"));
+    } else {
+        rules.push(format!("iifname \"{TAP}\" meta nfproto ipv6 drop"));
+    }
+    if gate == EgressGate::Closed {
+        rules.push(format!("iifname \"{TAP}\" ct status dnat ct direction reply accept"));
+        rules.push(format!("iifname \"{TAP}\" drop"));
+    }
+    rules.push("ct state established,related accept".into());
+    rules.push("ct status dnat accept".into());
+    rules.push(format!("iifname \"{TAP}\" oifname \"{EGRESS}\" ip daddr @allow accept"));
+    rules.push(format!("iifname \"{TAP}\" oifname \"{EGRESS}\" ip daddr @deny drop"));
+    if spec.ipv6 {
+        rules.push(format!(
+            "iifname \"{TAP}\" oifname \"{EGRESS}\" ip6 daddr @allow6 accept"
+        ));
+        rules.push(format!("iifname \"{TAP}\" oifname \"{EGRESS}\" ip6 daddr @deny6 drop"));
+    }
+    rules.push(format!("iifname \"{TAP}\" oifname \"{EGRESS}\" accept"));
+    rules
+}
+
+/// The `nft -f` script that switches a running VM's namespace to `gate`: it empties the
+/// `forward` chain of [`ruleset`]'s table and refills it, in one transaction, so no packet
+/// ever sees a half-switched chain (or an empty one: the chain's policy is drop either way).
+/// The sets and the other chains are left alone, so [`EgressGate::Policy`] brings back the
+/// chain [`ruleset`] loaded. Applying it twice is the same as applying it once. `spec` must be
+/// the one the ruleset was made from, with [`NetSpec::ipv6`] as the namespace has it.
+#[doc(hidden)]
+pub fn egress_script(spec: &NetSpec, gate: EgressGate) -> String {
+    let mut script = String::from("flush chain inet vmkit forward\n");
+    for rule in forward_rules(spec, gate) {
+        script += &format!("add rule inet vmkit forward {rule}\n");
+    }
+    script
+}
+
 /// The nftables ruleset for the VM's namespace. `host` lists the host's own addresses and
 /// the IPv6 prefixes it reaches directly, which `Restricted` denies (pasta would otherwise
 /// reach them through host sockets).
@@ -394,7 +461,7 @@ pub fn ruleset(spec: &NetSpec, host: &[Cidr]) -> String {
         allow6,
     } = sets(spec, host);
     // Without IPv6 the guest's IPv6 is dropped, and nothing of it reaches the namespace.
-    let (guard, from_tap, to_egress, nd) = if spec.ipv6 {
+    let (guard, nd) = if spec.ipv6 {
         let link = Cidr::new(GATEWAY6, PREFIX6).expect("a valid prefix");
         (
             format!(
@@ -404,20 +471,17 @@ pub fn ruleset(spec: &NetSpec, host: &[Cidr]) -> String {
   }}
 "
             ),
-            format!("    iifname \"{TAP}\" ip6 saddr != {GUEST6} drop\n"),
-            format!(
-                "    iifname \"{TAP}\" oifname \"{EGRESS}\" ip6 daddr @allow6 accept
-    iifname \"{TAP}\" oifname \"{EGRESS}\" ip6 daddr @deny6 drop
-"
-            ),
             format!(
                 "    iifname \"{TAP}\" ip6 saddr {GUEST6} ip6 hoplimit 255 icmpv6 type nd-neighbor-solicit accept\n"
             ),
         )
     } else {
-        let drop = format!("    iifname \"{TAP}\" meta nfproto ipv6 drop\n");
-        (String::new(), drop, String::new(), String::new())
+        (String::new(), String::new())
     };
+    let forward: String = forward_rules(spec, EgressGate::Policy)
+        .iter()
+        .map(|r| format!("    {r}\n"))
+        .collect();
     let mut prerouting = String::new();
     let mut output = String::new();
     for proto in ["udp", "tcp"] {
@@ -449,13 +513,7 @@ pub fn ruleset(spec: &NetSpec, host: &[Cidr]) -> String {
   }}
   chain forward {{
     type filter hook forward priority filter; policy drop;
-    iifname \"{TAP}\" ip saddr != {GUEST} drop
-{from_tap}    ct state established,related accept
-    ct status dnat accept
-    iifname \"{TAP}\" oifname \"{EGRESS}\" ip daddr @allow accept
-    iifname \"{TAP}\" oifname \"{EGRESS}\" ip daddr @deny drop
-{to_egress}    iifname \"{TAP}\" oifname \"{EGRESS}\" accept
-  }}
+{forward}  }}
   chain input {{
     type filter hook input priority filter; policy accept;
     iifname \"{TAP}\" ct state established,related accept
@@ -956,6 +1014,95 @@ mod tests {
                 "{egress:?}:\n{r}"
             );
         }
+    }
+
+    /// The rules of `ruleset`'s forward chain, without indentation or the base-chain line.
+    fn forward_chain(r: &str) -> Vec<String> {
+        let chain = &r[r.find("  chain forward {\n").unwrap_or_else(|| panic!("{r}"))..];
+        let chain = &chain[..chain.find("\n  }").unwrap()];
+        chain.lines().skip(2).map(|l| l.trim().to_string()).collect()
+    }
+
+    /// The rules an egress script adds, in order.
+    fn script_rules(script: &str) -> Vec<String> {
+        let mut lines = script.lines();
+        assert_eq!(lines.next(), Some("flush chain inet vmkit forward"), "{script}");
+        lines
+            .map(|l| {
+                l.strip_prefix("add rule inet vmkit forward ")
+                    .unwrap_or_else(|| panic!("{l:?} in:\n{script}"))
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reopening_egress_restores_exactly_the_chain_the_vm_started_with() {
+        for ipv6 in [false, true] {
+            for egress in [Egress::Restricted, Egress::DenyAll, Egress::Open] {
+                let spec = NetSpec {
+                    egress,
+                    ipv6,
+                    allow: vec!["10.9.0.0/16".parse().unwrap()],
+                    ..NetSpec::default()
+                };
+                let boot = forward_chain(&ruleset(&spec, &["192.168.5.15/32".parse().unwrap()]));
+                assert_eq!(
+                    script_rules(&egress_script(&spec, EgressGate::Policy)),
+                    boot,
+                    "{egress:?} ipv6={ipv6}"
+                );
+                // The sets hold the policy, and the script never touches them.
+                let script = egress_script(&spec, EgressGate::Closed);
+                assert!(!script.contains("set ") && !script.contains("elements"), "{script}");
+            }
+        }
+        assert_eq!(EgressGate::default(), EgressGate::Policy);
+    }
+
+    #[test]
+    fn closed_egress_drops_everything_from_the_tap_but_replies_on_forwards() {
+        for ipv6 in [false, true] {
+            let spec = NetSpec {
+                ipv6,
+                ..NetSpec::default()
+            };
+            let open = script_rules(&egress_script(&spec, EgressGate::Policy));
+            let closed = script_rules(&egress_script(&spec, EgressGate::Closed));
+            let at = |rule: &str| {
+                closed
+                    .iter()
+                    .position(|r| r == rule)
+                    .unwrap_or_else(|| panic!("{rule}: {closed:?}"))
+            };
+            // Two rules more, ahead of the established/related accept: connections the guest
+            // opened while egress was open are cut too. Only replies on connections into the
+            // guest (port forwards, DNAT'd in the original direction) pass. DNS is DNAT'd as
+            // well, but its packets from the guest are in the original direction: dropped.
+            assert_eq!(closed.len(), open.len() + 2, "{closed:?}");
+            let replies = at("iifname \"tap0\" ct status dnat ct direction reply accept");
+            let drop = at("iifname \"tap0\" drop");
+            assert_eq!(drop, replies + 1);
+            assert!(drop < at("ct state established,related accept"));
+            assert!(drop < at("ct status dnat accept"));
+            assert!(drop < at("iifname \"tap0\" oifname \"egress0\" ip daddr @allow accept"));
+            assert_eq!(
+                closed[..replies].iter().chain(&closed[drop + 1..]).collect::<Vec<_>>(),
+                open.iter().collect::<Vec<_>>()
+            );
+            // The spoofing guards still come first.
+            assert!(at(&format!("iifname \"tap0\" ip saddr != {GUEST} drop")) < replies);
+            // DNS reaches pasta through the forward chain: it is DNAT'd to an address
+            // outside the namespace, not answered by the namespace itself.
+            let r = ruleset(&spec, &[]);
+            for proto in ["udp", "tcp"] {
+                let dnat = format!("ip daddr {GATEWAY} {proto} dport 53 dnat ip to {DNS_FORWARD}");
+                assert!(r.contains(&dnat), "{r}");
+            }
+        }
+        // Applying a script twice is the same as once: it always starts from an empty chain.
+        let spec = NetSpec::default();
+        assert!(egress_script(&spec, EgressGate::Closed).starts_with("flush chain inet vmkit forward\n"));
     }
 
     #[test]

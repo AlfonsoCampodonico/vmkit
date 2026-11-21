@@ -198,6 +198,7 @@ What each step does on each backend:
 | `start` | `PUT /actions` `InstanceStart` | `PUT /api/v1/vm.boot` |
 | `pause` / `resume` | `PATCH /vm` `Paused` / `Resumed` | `PUT /api/v1/vm.pause` / `vm.resume` |
 | `kill` | SIGKILL to the VMM (by pidfd, after checking it is still the helper's child), else to the helper | same |
+| `set_egress` | `vmkit-sandbox nft` enters the VM's user and network namespaces (by pidfd, after the same check) and runs one `nft -f -` transaction that refills the `forward` chain | same |
 | guest ends the VM | `reboot` | `poweroff`; a reset is stopped by the backstop |
 | `snapshot` | pause, `PUT /snapshot/create` (Full) into `/vm/sock/snapshot`, then the files move into the bundle and writable disks are copied sparsely | `vm.pause`, `vm.snapshot` into `/vm/sock/snapshot`, then the same |
 | `restore` | a fresh sandboxed `firecracker` with the bundle files bound at `/vm/snapshot`, then `PUT /snapshot/load` (File backend, paused) | a fresh `cloud-hypervisor` with the bundle files and a **rewritten** `config.json` (allowlisted fields, vmkit's own paths and Landlock rules) bound at `/vm/snapshot`, then `vm.restore` (paused; `Copy`, or `OnDemand` for lazy memory) |
@@ -257,6 +258,23 @@ flowchart LR
 - `pasta` gives the namespace the host's outbound addresses (the one on its IPv4 default route, `net::outbound_address`, and with IPv6 the global addresses of the interface on its IPv6 default route, `net::outbound_addresses6`), so the guest can never reach them. An `allow` entry that is exactly one of them is refused (`Error::InvalidSpec`, `NetSpec::check_allow`); a wider entry still reaches its other addresses. The host's other addresses are reachable through an `allow` exception.
 - Each `PortForward { protocol, address, host, guest }` names the host address `pasta` listens on (`127.0.0.1` keeps it to this host, `0.0.0.0` listens on every address). A host port can be forwarded once per protocol, whatever its addresses, because the namespace sees only the port. Ports below 1024 cannot be forwarded by an unprivileged `pasta` unless the host lowers `net.ipv4.ip_unprivileged_port_start`; creating the VM then fails with `pasta`'s message.
 - The guest kernel is built without netfilter: the policy lives outside the VM.
+
+#### Closing egress at runtime (`Vm::set_egress`)
+
+`vm.set_egress(EgressGate::Closed)` shuts the guest's egress while the VM runs, and `vm.set_egress(EgressGate::Policy)` brings back the VM's own `NetSpec` policy (`egress` and `allow`, unchanged). kiln uses it to run build steps with and without network in one VM.
+
+| Traffic | `Policy` (every VM starts so) | `Closed` |
+|---|---|---|
+| New outbound TCP, UDP or ICMP from the guest | as `egress` and `allow` say | dropped, to every destination, `allow` entries included |
+| DNS to the gateway (`172.30.0.1:53`, UDP and TCP) | answered by `pasta` | dropped |
+| Packets of connections the guest opened before the gate closed (a process that kept a socket from an earlier step) | flow | dropped (the remote end's packets still arrive, the guest's never leave) |
+| Port forwards into the guest | reach the guest | still reach the guest, and the guest's replies on them get out (DNAT'd, reply direction) |
+| The VMM's own connections | none (`local_out`) | none |
+
+- The switch is one `nft -f -` transaction in the VM's namespace: it flushes the `forward` chain and refills it, so no packet sees a half-switched chain. `Closed` adds two rules ahead of the one that accepts established and related traffic: `iifname "tap0" ct status dnat ct direction reply accept` (the guest's replies on port forwards) and `iifname "tap0" drop` (everything else from the tap). DNS is DNAT'd too, but its packets from the guest are in the original direction, so they are dropped; ICMPv6 neighbour discovery goes to the `input` chain and is not affected. `Policy` reloads the boot chain unchanged. The sets and the other chains are never touched.
+- It is idempotent and can be repeated any number of times. It works from `create` on (before `start`, so a VM can boot closed) and while the VM is paused. A restored VM starts with `Policy` again: the gate is not part of a snapshot.
+- vmkit enters the namespace with a short-lived `vmkit-sandbox nft <pid> <parent> <nft>`: a pidfd for the VMM, a check that the VMM is still the child of the VM's outer helper, `setns` into its user and network namespaces (not its mount or PID namespace), and `nft` with `CAP_NET_ADMIN` there only. No `nsenter` is needed.
+- Errors: `Error::EgressUnavailable` for a VM without a network of vmkit's own (no NIC, or a `TapAttach` tap, whose caller owns the policy); `Error::EgressFailed` when the VM has ended or `nft` fails (or takes over 10 s), with the policy in force unchanged. `Vm` implementations outside vmkit get `EgressUnavailable` from the trait's default method.
 
 #### Attaching to a caller's tap (`TapAttach`)
 
@@ -338,7 +356,7 @@ The `supports_*` fields describe the backends; vmkit does not implement those fe
 
 ### Errors
 
-`vmkit::Error`: `Io`, `BinaryNotFound` (set the env variable or put it on `PATH`), `ToolNotFound` (`ip`, `nft`, `newuidmap`, ...), `VersionTooOld`, `VersionUnknown`, `Api` (a VMM API call failed, with status and body), `Http`, `TooManyDevices`, `InvalidSpec`, `Prerequisite` (for example a missing subordinate id range), `Unsupported`, `EarlyExit` (the VMM exited before its API was up, with the end of its logs), `Timeout`.
+`vmkit::Error`: `Io`, `BinaryNotFound` (set the env variable or put it on `PATH`), `ToolNotFound` (`ip`, `nft`, `newuidmap`, ...), `VersionTooOld`, `VersionUnknown`, `Api` (a VMM API call failed, with status and body), `Http`, `TooManyDevices`, `InvalidSpec`, `Prerequisite` (for example a missing subordinate id range), `Unsupported`, `EarlyExit` (the VMM exited before its API was up, with the end of its logs), `Timeout`, `EgressUnavailable` and `EgressFailed` (`Vm::set_egress`).
 
 ### Environment variables
 
@@ -466,7 +484,7 @@ Hosted arm64 runners have no KVM, so the aarch64 kernel is boot-tested by hand a
 | `tests/sandbox.rs` | Linux, `VMKIT_SANDBOX`; no KVM (busybox stands in for the VMM) | root contents, read-only binds, exit mirroring, no privileges, inherited descriptors, symlinks, no user namespaces, session keyring; network checks with `VMKIT_TEST_NET=1` |
 | `tests/exec.rs` | Linux, `VMKIT_SANDBOX`, `uidmap`, a subuid range, `/usr/bin/busybox`; no KVM | ids, roots, overlay whiteouts and xattrs, nesting, env and cwd, seccomp; egress with `VMKIT_TEST_NET=1` |
 | `tests/contract.rs` | KVM, both VMMs, `VMKIT_TEST_KERNEL`, `VMKIT_TEST_INITRAMFS` | on both backends: boot and exit method, reset backstop, panic, kill, disk order, writes to sector 0, device budget, guest-initiated vsock, symlinked disks refused, a run directory with a comma, the sandbox's contents and privileges |
-| `tests/network.rs` | as contract, plus `testguest/net-fixture.sh` and `VMKIT_TEST_NET=1` | the hostile guest, over IPv4 and IPv6: metadata, private and host addresses, the gateway, other VMs and spoofed sources are unreachable; allowed destinations, DNS and port forwards work; an `allow` entry for the outbound address is refused; a host port in use fails with `pasta`'s message |
+| `tests/network.rs` | as contract, plus `testguest/net-fixture.sh` and `VMKIT_TEST_NET=1` | the hostile guest, over IPv4 and IPv6: metadata, private and host addresses, the gateway, other VMs and spoofed sources are unreachable; allowed destinations, DNS and port forwards work; an `allow` entry for the outbound address is refused; a host port in use fails with `pasta`'s message; `set_egress` closes egress and DNS at runtime, cuts a connection the guest opened before, and reopens the VM's policy, repeatedly, while forwards keep working |
 | `tests/pause.rs` | as contract | pause stops the guest, resume continues it |
 | `tests/snapshot.rs` | as contract | snapshot and restore (local and lazy) continue the guest with its memory, disk and new vsock connections; a bundle restores twice and is never written; foreign, tampered and lazily corrupted bundles are refused |
 | `tests/attach.rs` | as contract, run inside the namespace `testguest/attach-fixture.sh` makes (sudo), with `VMKIT_TEST_ATTACH=1` | on both backends: a VM on an attached tap reaches the caller's namespace |
@@ -516,7 +534,7 @@ src/
   seccomp.rs             seccomp deny list for programs
   subid.rs               /etc/subuid and /etc/subgid parsing
   error.rs               Error
-  bin/vmkit-sandbox.rs   the sandbox helper (run, userns, init)
+  bin/vmkit-sandbox.rs   the sandbox helper (run, userns, init, nft)
 tests/                   integration suites (see Tests)
 testguest/               busybox test guest, initramfs builder, network fixture, smoke test
 kernels/                 base kernel profile, build script, checksums

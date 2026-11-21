@@ -3,7 +3,8 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::net::EgressGate;
 use crate::spec::{Capabilities, RestoreSpec, SnapshotBundle, VmEnd, VmSpec};
 
 /// A VMM backend. Create VMs from it; decide on `capabilities`, never on `name`.
@@ -36,4 +37,23 @@ pub trait Vm: Send {
     fn capabilities(&self) -> Capabilities;
     /// The host side of the vsock device, if the spec had one.
     fn vsock_socket(&self) -> Option<&Path>;
+    /// Closes or reopens the guest's egress while the VM runs, without touching anything
+    /// else: [`EgressGate::Closed`] drops everything the guest sends through its namespace
+    /// (new connections, DNS, and connections it opened while egress was open) but its
+    /// replies on port forwards, [`EgressGate::Policy`] puts the VM's own [`crate::NetSpec`]
+    /// policy (`egress` and `allow`) back. The switch is one atomic `nft` transaction in the
+    /// VM's network namespace: no packet sees a mix of the two. It is idempotent, may be
+    /// repeated any number of times, and works from `create` on (before `start` too) and while
+    /// the VM is paused. Port forwards keep reaching the guest. A connection cut by closing
+    /// may resume after reopening, if neither end gave up meanwhile. Every VM starts with
+    /// `Policy`, a restored one too.
+    ///
+    /// Fails with [`Error::EgressUnavailable`] for a VM without a network of vmkit's own (no
+    /// NIC, or a [`crate::TapAttach`] tap), and with [`Error::EgressFailed`] if the VM has
+    /// ended or `nft` fails, leaving the policy in force as it was. The default
+    /// implementation (for `Vm`s outside vmkit) is unavailable.
+    fn set_egress(&mut self, gate: EgressGate) -> Result<()> {
+        let _ = gate;
+        Err(Error::EgressUnavailable("this Vm does not implement set_egress"))
+    }
 }

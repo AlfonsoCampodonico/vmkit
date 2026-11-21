@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::http;
+use crate::net::EgressGate;
+use crate::sandbox::EgressControl;
 use crate::spec::{EndReason, VmEnd};
 
 /// How long a VMM may take to open its API socket.
@@ -117,6 +119,8 @@ pub(crate) struct Proc {
     logs: Vec<PathBuf>,
     /// For a sandboxed VMM: the file with its host PID (see [`Proc::with_vmm_pid_file`]).
     vmm_pid_file: Option<PathBuf>,
+    /// For a sandboxed VMM with a network of vmkit's own: how to switch its egress; else why not.
+    egress: std::result::Result<EgressControl, &'static str>,
 }
 
 /// Starts `binary args...` with the guest serial (the VMM's stdout) appended to
@@ -143,6 +147,7 @@ pub(crate) fn spawn(binary: &Path, args: &[String], console_log: &Path, log: &Pa
         end: Arc::new(Mutex::new(None)),
         logs: vec![log.to_path_buf()],
         vmm_pid_file: None,
+        egress: Err("it has no NIC"),
     })
 }
 
@@ -159,6 +164,28 @@ impl Proc {
     pub(crate) fn with_vmm_pid_file(mut self, path: &Path) -> Self {
         self.vmm_pid_file = Some(path.to_path_buf());
         self
+    }
+
+    /// How [`Proc::set_egress`] switches the VMM's egress, or why it cannot.
+    pub(crate) fn with_egress(mut self, egress: std::result::Result<EgressControl, &'static str>) -> Self {
+        self.egress = egress;
+        self
+    }
+
+    /// Switches the egress of the VMM's network namespace to `gate` (see `Vm::set_egress`).
+    pub(crate) fn set_egress(&self, gate: EgressGate) -> Result<()> {
+        let control = self.egress.as_ref().map_err(|why| Error::EgressUnavailable(why))?;
+        let ended = || Error::EgressFailed("the VM has ended".into());
+        if self.try_end()?.is_some() {
+            return Err(ended());
+        }
+        let file = self.vmm_pid_file.as_ref().ok_or_else(ended)?;
+        let vmm = std::fs::read_to_string(file)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .ok_or_else(|| Error::EgressFailed(format!("no VMM pid in {}", file.display())))?;
+        let parent = self.child.lock().expect("not poisoned").id();
+        control.apply(vmm, parent, gate)
     }
 
     /// The last lines of the VMM's logs, for error messages (empty when there are none).

@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::binary::{self, Version};
 use crate::bundle::{self, Expect, Layout, VmmId};
 use crate::error::{Error, Result};
-use crate::net;
+use crate::net::{self, EgressGate};
 use crate::process::{self, Proc};
 use crate::sandbox::{self, Mount};
 use crate::snapshot::{self, Restore, Shape};
@@ -293,6 +293,10 @@ impl Vm for FirecrackerVm {
 
     fn vsock_socket(&self) -> Option<&Path> {
         self.vsock.as_deref()
+    }
+
+    fn set_egress(&mut self, gate: EgressGate) -> Result<()> {
+        self.proc.set_egress(gate)
     }
 }
 
