@@ -14,6 +14,10 @@ curl -sfL --retry 3 --retry-delay 2 -o "$work/linux-$version.tar.xz" "https://cd
 (cd "$here" && grep " microvm-kernel-ci-$arch-$series.config\$" SHA256SUMS | sha256sum -c --quiet -)
 tar -xJf "$work/linux-$version.tar.xz" -C "$work"
 src="$work/linux-$version"
+# vmkit's own patches, in order (kernels/patches/README.md).
+for p in "$here"/patches/*.patch; do
+  patch -s -p1 -d "$src" < "$p"
+done
 case $arch in
   aarch64) karch=arm64; image=arch/arm64/boot/Image; cross=aarch64-linux-gnu- ;;
   x86_64) karch=x86; image=vmlinux; cross=x86_64-linux-gnu- ;;

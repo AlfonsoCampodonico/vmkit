@@ -9,6 +9,9 @@ guest side did not change. The kernel, the init layer (erofs, built by
 `kiln_image::init_layer`), `root=/dev/vda rootfstype=erofs init=/kiln-init` and
 kiln-proto over vsock port 1024 all work as they are.
 
+VZ reboots a guest in place on reset, so a guest reset never ended the VM. A small
+opt-in kernel patch, `vmkit.reset=poweroff`, fixes that (§5).
+
 The helper is `spike/vmkit-vz/` (`main.swift`, `vmkit-vz.entitlements`, `build.sh`).
 It is not wired into vmkit's API.
 
@@ -82,8 +85,8 @@ the virtio console registers (about 0.17 s) are not in it:
 
 kiln-init prints nothing on success, so the log stops at `Run /kiln-init`. When the
 host closes the control connection, kiln-init prints `kiln-init: control: the host
-closed the control connection before Config` and calls `reboot()`. See §5 for why
-that matters on VZ.
+closed the control connection before Config` and calls `reboot()`. On VZ that
+loops, unless the kernel has the reset patch (§5).
 
 The host-initiated path was checked with a small static vsock echo guest listening
 on port 5000. `CONNECT 5000\n` got `OK 3830849844\n`, a line echoed back, and a
@@ -165,23 +168,38 @@ The test guest booted 21–27 times in 4 s. kiln-init looped too: it reboots bef
 `Config` when the host has gone, so it reconnected every ~320 ms. Only power-off
 (PSCI `SYSTEM_OFF`) ends the VM, and then `guestDidStop` fires.
 
-This is the same problem vmkit's Cloud Hypervisor reset backstop solves (kiln spec
-§4.1: a guest reset must end the VM), but VZ gives the host nothing to watch.
-Options:
+This is the problem vmkit's Cloud Hypervisor reset backstop solves (kiln spec §4.1:
+a guest reset must end the VM). VZ gives the host nothing to watch, so the fix goes
+in the guest kernel.
 
-1. `Capabilities::guest_exit = Poweroff`, so kiln picks `ExitMethod::Poweroff` after
-   `Config`. This needs no change.
-2. kiln-init: power off rather than reboot in its pre-`Config` failure path. Poweroff
-   ends the VM on all three backends, as Cloud Hypervisor already requires.
-3. Panics and stray reboots still loop. The cleanest fix is in vmkit's own kernel: a
-   small patch, or a `reboot=`-style parameter, that turns `machine_restart` into a
-   PSCI `SYSTEM_OFF`. vmkit builds its own kernels, so this is cheap. Without it, the
-   backstop has to be a host-side heuristic:
-   - a second guest connection to a vsock port that should be connected only once,
-     which kiln knows but vmkit does not;
-   - or a console marker.
+**Fixed: `kernels/patches/0001-reset-poweroff.patch`.** It adds the kernel argument
+`vmkit.reset=poweroff`. With it, `do_kernel_restart()` runs the power-off handlers
+(PSCI `SYSTEM_OFF` on arm64) before the restart handlers. Every reset path then ends
+the VM:
 
-   Neither is generic. Recommended: the kernel patch, plus option 2.
+- `reboot(2)`;
+- a panic with `panic=-1` (`emergency_restart()`);
+- PID 1 exiting.
+
+Without the argument the kernel behaves as upstream does, so Firecracker and Cloud
+Hypervisor are unaffected. The VZ backend appends the argument as one of "its
+backend's own parameters" (kiln spec §8.3).
+
+Checked with `spike/vmkit-vz/resettest.sh`, on the test initramfs with
+`vmkit.reset=poweroff`. The patched build's sha256 is `ca49e968…`.
+
+| guest action | unpatched kernel, 10 s | patched kernel |
+|---|---|---|
+| `reboot -f` | 52 boots, VM never ends | 1 boot, `guestDidStop` at 276 ms |
+| panic (`sysrq c`) | 66 boots | 1 boot, ends at 217 ms |
+| PID 1 exits | 64 boots | 1 boot, ends at 227 ms |
+| `poweroff -f` | 1 boot, ends | 1 boot, ends at 267 ms |
+
+kiln-init needs no change. With the patched kernel, its pre-`Config` `reboot()`
+(host closed the control connection) ends the VM after one boot. The helper sees
+`guestDidStop` 100 ms after the host closes and exits 0. With `vmkit.reset=poweroff`
+appended, `Capabilities::guest_exit` can be `Poweroff` or `Reboot`. `Poweroff` is
+still the natural value, since that is what VZ itself honours.
 
 ## 6. vsock bridge (Firecracker's hybrid scheme)
 
@@ -265,7 +283,7 @@ Even when save works, the VZ model differs from vmkit's bundle model:
 |---|---|
 | `kernel` | `VZLinuxBootLoader(kernelURL:)`: an uncompressed `Image` |
 | `initramfs` | `VZLinuxBootLoader.initialRamdiskURL` (checked with the vmkit test initramfs) |
-| `cmdline` + console | `commandLine`. The driver appends `console=hvc0`. |
+| `cmdline` + console | `commandLine`. The driver appends `console=hvc0 vmkit.reset=poweroff` (§5). |
 | `disks[i]` | `VZVirtioBlockDeviceConfiguration(VZDiskImageStorageDeviceAttachment(url:readOnly:))`, in order `vda`, `vdb`, … Raw images; the size must be a multiple of 512. |
 | `vcpus`, `memory_mib` | `cpuCount`, `memorySize` (bytes) |
 | `vsock` | `VZVirtioSocketDeviceConfiguration` + the helper's bridge (§6) |
@@ -408,8 +426,9 @@ vmkit's binary. Discovery checks its entitlement with
 
 ## 12. Open items
 
-1. The reset backstop (§5): a kernel patch or kiln-init's pre-`Config` poweroff,
-   before VZ can be a real backend.
+1. Release a base kernel that carries the reset patch, so kiln can pin it. The patch
+   is merged, but the `kernels-6.18.54` release predates it. The patched build needs
+   a new release tag.
 2. Snapshots: confirm that a Team ID signature fixes `SecKeyCreateRandomKey`
    (`snaptest.sh`).
 3. `VsockSpec` grows a host port list, and the backend checks `sun_path` length.
