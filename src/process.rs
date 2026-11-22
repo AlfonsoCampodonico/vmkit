@@ -188,6 +188,12 @@ impl Proc {
         control.apply(vmm, parent, gate)
     }
 
+    /// The child's PID.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.lock().expect("not poisoned").id()
+    }
+
     /// The last lines of the VMM's logs, for error messages (empty when there are none).
     pub(crate) fn log_tail(&self) -> String {
         let mut tail = Vec::new();
@@ -199,7 +205,7 @@ impl Proc {
         tail.join(" | ")
     }
 
-    fn early_exit(&self, end: VmEnd) -> Error {
+    pub(crate) fn early_exit(&self, end: VmEnd) -> Error {
         Error::EarlyExit(format!("{end:?}: {}", self.log_tail()))
     }
 

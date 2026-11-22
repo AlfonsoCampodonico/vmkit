@@ -16,6 +16,23 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
+  # The Apple VZ helper: it must build with swiftc and carry the virtualization entitlement.
+  # The VM suites need a Mac that can run VMs; GitHub's arm64 macOS runners are themselves VMs
+  # without nested virtualization, so `vmkit-vz --check` reports that and the suites are skipped.
+  # They also need the patched aarch64 kernel and the test initramfs, which build on Linux.
+  apple-vz:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and sign vmkit-vz
+        run: scripts/build-vmkit-vz.sh
+      - name: Can this runner run VMs?
+        run: |
+          if target/vmkit-vz/vmkit-vz --check; then
+            echo "::notice::this runner supports Virtualization.framework"
+          else
+            echo "::warning::this runner cannot run Virtualization.framework VMs; the apple-vz VM suites run locally (README, Tests)"
+          fi
   # The sandbox, contract and network suites on x86_64 KVM (hosted arm64 runners have no /dev/kvm; aarch64
   # runs on the Lima template, kiln spec §11.7).
   contract-x86_64:

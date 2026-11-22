@@ -1,4 +1,5 @@
-//! Pause and resume on both backends, run on an otherwise idle host.
+//! Pause and resume on both Linux backends, and on Apple VZ on macOS, run on an otherwise idle
+//! host.
 //!
 //! Cloud Hypervisor 53 on aarch64 can leave a guest stuck after a resume when other
 //! VMs load the host (reproduced with plain `ch-remote` under nested virtualization;
@@ -31,12 +32,20 @@ fn pause_stops_the_guest_and_resume_continues_it(backend: Backend) {
     vm.kill().unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn firecracker() {
     pause_stops_the_guest_and_resume_continues_it(Backend::Firecracker)
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn cloud_hypervisor() {
     pause_stops_the_guest_and_resume_continues_it(Backend::CloudHypervisor)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn apple_vz() {
+    pause_stops_the_guest_and_resume_continues_it(Backend::AppleVz)
 }

@@ -26,6 +26,13 @@ pub enum Error {
         status: u16,
         body: String,
     },
+    /// A VMM operation outside an HTTP API failed (the `apple-vz` helper's `start`, say).
+    #[error("{backend} {op} failed: {message}")]
+    VmmOp {
+        backend: &'static str,
+        op: &'static str,
+        message: String,
+    },
     #[error("malformed API response: {0}")]
     Http(String),
     #[error("{requested} virtio devices requested but only {available} are available")]

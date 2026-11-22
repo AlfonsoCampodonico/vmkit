@@ -1,7 +1,10 @@
-//! VMM-neutral microVM lifecycle for Firecracker and Cloud Hypervisor (kiln spec §4.1), and the
-//! rootless sandbox the VMMs run in, which also runs any other program ([`sandbox`]).
+//! VMM-neutral microVM lifecycle for Firecracker and Cloud Hypervisor on Linux and Apple's
+//! Virtualization.framework on macOS (kiln spec §4.1), and the rootless sandbox the Linux VMMs
+//! run in, which also runs any other program ([`sandbox`]).
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "macos")]
+mod apple_vz;
 mod binary;
 mod bundle;
 mod ch_config;
@@ -22,6 +25,8 @@ mod spec;
 mod subid;
 mod vmm;
 
+#[cfg(target_os = "macos")]
+pub use apple_vz::AppleVz;
 pub use bundle::{BUNDLE_FILE, BUNDLE_VERSION, BundleInfo, BundleVsock, DiskInfo, FileInfo, Role, VmmId, disk_file};
 pub use cloud_hypervisor::CloudHypervisor;
 pub use error::{Error, Result};
@@ -38,16 +43,24 @@ pub use vmm::{Vm, Vmm};
 pub enum Backend {
     Firecracker,
     CloudHypervisor,
+    /// Apple's Virtualization.framework through the `vmkit-vz` helper (macOS only).
+    #[cfg(target_os = "macos")]
+    AppleVz,
 }
 
 impl Backend {
+    #[cfg(not(target_os = "macos"))]
     pub const ALL: [Backend; 2] = [Backend::Firecracker, Backend::CloudHypervisor];
+    #[cfg(target_os = "macos")]
+    pub const ALL: [Backend; 3] = [Backend::Firecracker, Backend::CloudHypervisor, Backend::AppleVz];
 
     /// Finds and version-checks the backend's binary.
     pub fn discover(self) -> Result<Box<dyn Vmm>> {
         Ok(match self {
             Backend::Firecracker => Box::new(Firecracker::discover()?),
             Backend::CloudHypervisor => Box::new(CloudHypervisor::discover()?),
+            #[cfg(target_os = "macos")]
+            Backend::AppleVz => Box::new(AppleVz::discover()?),
         })
     }
 }

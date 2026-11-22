@@ -33,7 +33,8 @@ Version 0.1.0. Not published to crates.io; consumers depend on it by git revisio
 | Snapshot and restore | Works | Full snapshots of state, memory and writable disks into a bundle directory; restore into a fresh sandboxed VMM. Same VMM, version and arch only. Snapshot suite on aarch64 (Lima) and x86_64 (CI). |
 | Lazy restore | Works (Linux) | A FUSE mount in the sandbox serves memory and disks from verified chunks fetched on demand (`vmkit::lazy`). Lazy memory on Firecracker always; on Cloud Hypervisor only with userfaultfd access, else memory is copied in through the same layer. |
 | Balloon, drive remapping, diff snapshots | Not implemented | `Capabilities` reports what each backend could support; vmkit has no API for them yet. |
-| macOS | Builds only | The library compiles and its unit tests pass; creating VMs or sandboxes needs Linux. |
+| Apple Virtualization backend (macOS) | Works | `Backend::AppleVz` on Apple Silicon through the signed `vmkit-vz` helper: create, start, pause, resume, kill, wait, disks, console and guest-initiated vsock. No NIC (egress is always denied) and no snapshots. Needs the kernel with the `vmkit.reset=poweroff` patch. Contract and pause suites run locally; see [docs/apple-vz.md](docs/apple-vz.md). |
+| macOS sandboxes | Not available | `vmkit::sandbox` and the Linux backends need Linux. |
 | `base` kernel profile | Released | `kernels-6.18.54`: GitHub release assets and `ghcr.io/alfonsocampodonico/vmkit-kernels/base`. |
 
 ## Quick start
@@ -325,8 +326,8 @@ All public items are re-exported from the crate root unless a module is named.
 
 | Item | Description |
 |---|---|
-| `Backend::{Firecracker, CloudHypervisor}`, `Backend::ALL` | The supported backends. |
-| `Backend::discover() -> Result<Box<dyn Vmm>>` | Finds the binary (`$VMKIT_FIRECRACKER` / `$VMKIT_CLOUD_HYPERVISOR`, else `PATH`), checks its version, and finds the sandbox helper. `Firecracker::discover()` and `CloudHypervisor::discover()` do the same for one backend. |
+| `Backend::{Firecracker, CloudHypervisor}`, `Backend::AppleVz` (macOS), `Backend::ALL` | The supported backends. |
+| `Backend::discover() -> Result<Box<dyn Vmm>>` | Finds the binary (`$VMKIT_FIRECRACKER` / `$VMKIT_CLOUD_HYPERVISOR`, else `PATH`), checks its version, and finds the sandbox helper. `Firecracker::discover()` and `CloudHypervisor::discover()` do the same for one backend. `AppleVz::discover()` finds `vmkit-vz` (`$VMKIT_VZ`, else `PATH`) and checks its version and entitlement. |
 | `Vmm::name()` | For logs only. |
 | `Vmm::capabilities() -> Capabilities` | See the table below. |
 | `Vmm::create(&VmSpec) -> Result<Box<dyn Vm>>` | Starts the VMM in the sandbox and configures it; the guest has not started. |
@@ -342,27 +343,29 @@ All public items are re-exported from the crate root unless a module is named.
 
 `Capabilities` per backend:
 
-| Field | Firecracker | Cloud Hypervisor |
-|---|---|---|
-| `max_virtio_devices` | 17 on x86_64, 92 on aarch64 | 31 |
-| `implicit_devices` | 0 | 1 (RNG) |
-| `available_devices()` (disks + vsock + NIC) | 17 / 92 | 30 |
-| `guest_exit` | `Reboot` | `Poweroff` |
-| `console` | `ttyS0` | `ttyAMA0` on aarch64, `ttyS0` on x86_64 |
-| `supports_diff_snapshot`, `supports_balloon`, `supports_drive_remap` | true, true, true | false, true, false |
-| `lazy_memory` | true | true when the caller may use `/dev/userfaultfd` or `vm.unprivileged_userfaultfd` is 1 |
+| Field | Firecracker | Cloud Hypervisor | Apple VZ |
+|---|---|---|---|
+| `max_virtio_devices` | 17 on x86_64, 92 on aarch64 | 31 | 27 |
+| `implicit_devices` | 0 | 1 (RNG) | 2 (console, RNG) |
+| `available_devices()` (disks + vsock + NIC) | 17 / 92 | 30 | 25 |
+| `guest_exit` | `Reboot` | `Poweroff` | `Poweroff` |
+| `console` | `ttyS0` | `ttyAMA0` on aarch64, `ttyS0` on x86_64 | `hvc0` |
+| `supports_snapshot` | true | true | false |
+| `supports_diff_snapshot`, `supports_balloon`, `supports_drive_remap` | true, true, true | false, true, false | false, false, false |
+| `lazy_memory` | true | true when the caller may use `/dev/userfaultfd` or `vm.unprivileged_userfaultfd` is 1 | false |
 
 The `supports_*` fields describe the backends; vmkit does not implement those features yet.
 
 ### Errors
 
-`vmkit::Error`: `Io`, `BinaryNotFound` (set the env variable or put it on `PATH`), `ToolNotFound` (`ip`, `nft`, `newuidmap`, ...), `VersionTooOld`, `VersionUnknown`, `Api` (a VMM API call failed, with status and body), `Http`, `TooManyDevices`, `InvalidSpec`, `Prerequisite` (for example a missing subordinate id range), `Unsupported`, `EarlyExit` (the VMM exited before its API was up, with the end of its logs), `Timeout`, `EgressUnavailable` and `EgressFailed` (`Vm::set_egress`).
+`vmkit::Error`: `Io`, `BinaryNotFound` (set the env variable or put it on `PATH`), `ToolNotFound` (`ip`, `nft`, `newuidmap`, ...), `VersionTooOld`, `VersionUnknown`, `Api` (a VMM API call failed, with status and body), `Http`, `TooManyDevices`, `InvalidSpec`, `Prerequisite` (for example a missing subordinate id range), `Unsupported` (for example snapshots or a NIC on Apple VZ), `VmmOp` (an Apple VZ helper operation failed), `EarlyExit` (the VMM exited before its API was up, with the end of its logs), `Timeout`, `EgressUnavailable` and `EgressFailed` (`Vm::set_egress`).
 
 ### Environment variables
 
 | Variable | Used for |
 |---|---|
 | `VMKIT_FIRECRACKER`, `VMKIT_CLOUD_HYPERVISOR` | VMM binaries; otherwise found on `PATH`. |
+| `VMKIT_VZ` | The Apple VZ helper (macOS); otherwise `vmkit-vz` on `PATH`. |
 | `VMKIT_SANDBOX` | The helper; otherwise `vmkit-sandbox` next to the running program, else on `PATH`. |
 | `VMKIT_PASTA` | `pasta`; otherwise found on `PATH`. `ip`, `nft`, `newuidmap` and `newgidmap` are looked up on `PATH`, then `/usr/sbin`, `/sbin`, `/usr/bin`, `/bin`. |
 
@@ -439,7 +442,14 @@ Both depend on vmkit by git revision (`vmkit = { git = "https://github.com/Alfon
 
 ### On a Mac
 
-The library builds on macOS (for kiln's commands that do not run VMs); creating VMs needs Linux. Use the Lima template (Apple M3 or later, macOS 15 or later, nested virtualization):
+On Apple Silicon, `Backend::AppleVz` runs VMs natively through Apple's Virtualization.framework. It needs the Xcode command-line tools to build its helper, and the aarch64 kernel with the `vmkit.reset=poweroff` patch:
+
+```bash
+scripts/build-vmkit-vz.sh                    # builds and ad-hoc signs target/vmkit-vz/vmkit-vz
+export VMKIT_VZ=$PWD/target/vmkit-vz/vmkit-vz
+```
+
+See [docs/apple-vz.md](docs/apple-vz.md) for what it supports. For the Linux backends, the sandbox and the network, use the Lima template (Apple M3 or later, macOS 15 or later, nested virtualization):
 
 ```bash
 limactl start --name vmkit lima/vmkit.yaml
@@ -488,6 +498,7 @@ Hosted arm64 runners have no KVM, so the aarch64 kernel is boot-tested by hand a
 | `tests/contract.rs` | KVM, both VMMs, `VMKIT_TEST_KERNEL`, `VMKIT_TEST_INITRAMFS` | on both backends: boot and exit method, reset backstop, panic, kill, disk order, writes to sector 0, device budget, guest-initiated vsock, symlinked disks refused, a run directory with a comma, the sandbox's contents and privileges |
 | `tests/network.rs` | as contract, plus `testguest/net-fixture.sh` and `VMKIT_TEST_NET=1` | the hostile guest, over IPv4 and IPv6: metadata, private and host addresses, the gateway, other VMs and spoofed sources are unreachable; allowed destinations, DNS and port forwards work; an `allow` entry for the outbound address is refused; a host port in use fails with `pasta`'s message; `set_egress` closes egress and DNS at runtime, cuts a connection the guest opened before, and reopens the VM's policy, repeatedly, while forwards keep working |
 | `tests/pause.rs` | as contract | pause stops the guest, resume continues it |
+| `tests/contract.rs`, `tests/pause.rs` on macOS | Apple Silicon, `VMKIT_VZ`, `VMKIT_TEST_KERNEL` (patched aarch64 `Image`), `VMKIT_TEST_INITRAMFS` | the contract suite on Apple VZ, without the Linux sandbox test, plus: a NIC is refused, `set_egress` is unavailable, snapshots are unsupported |
 | `tests/snapshot.rs` | as contract | snapshot and restore (local and lazy) continue the guest with its memory, disk and new vsock connections; a bundle restores twice and is never written; foreign, tampered and lazily corrupted bundles are refused |
 | `tests/attach.rs` | as contract, run inside the namespace `testguest/attach-fixture.sh` makes (sudo), with `VMKIT_TEST_ATTACH=1` | on both backends: a VM on an attached tap reaches the caller's namespace |
 
@@ -509,7 +520,7 @@ cargo test --test pause -- --test-threads=1
 
 In the Lima VM, build into a guest path (`CARGO_TARGET_DIR=~/target`) and install the profile for `$HOME/target/debug/vmkit-sandbox`.
 
-CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, clippy and the unit tests on Ubuntu 24.04 and macOS 15, and all five Linux suites on x86_64 KVM. aarch64 runs only on the Lima template, because hosted arm64 runners have no `/dev/kvm`.
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, clippy and the unit tests on Ubuntu 24.04 and macOS 15, and all five Linux suites on x86_64 KVM. On macOS 15 it also builds and signs `vmkit-vz`; GitHub's macOS runners cannot run VZ guests, so the Apple VZ suites run locally. aarch64 runs only on the Lima template, because hosted arm64 runners have no `/dev/kvm`.
 
 Notes:
 
@@ -526,6 +537,7 @@ src/
   lib.rs                 Backend, re-exports
   vmm.rs, spec.rs        the Vmm and Vm traits, VmSpec, Capabilities, VmEnd
   firecracker.rs         Firecracker driver
+  apple_vz.rs            Apple Virtualization driver (macOS), drives vz/
   cloud_hypervisor.rs    Cloud Hypervisor driver, Landlock rules, reset backstop
   events.rs              Cloud Hypervisor event stream reader
   http.rs                HTTP/1.1 client over a Unix socket
@@ -538,9 +550,10 @@ src/
   error.rs               Error
   bin/vmkit-sandbox.rs   the sandbox helper (run, userns, init, nft)
 tests/                   integration suites (see Tests)
+vz/                      vmkit-vz, the Swift helper for Apple VZ, and its entitlement
 testguest/               busybox test guest, initramfs builder, network fixture, smoke test
 kernels/                 base kernel profile, build script, checksums
-scripts/                 install-vmms.sh, install-apparmor.sh
+scripts/                 install-vmms.sh, install-apparmor.sh, build-vmkit-vz.sh
 lima/vmkit.yaml          Lima template for macOS
 docs/                    design notes (see Documentation)
 .github/workflows/       ci.yml, kernels.yml
@@ -550,6 +563,8 @@ docs/                    design notes (see Documentation)
 
 - [docs/README.md](docs/README.md): index of the documents below.
 - [docs/sandbox-helper.md](docs/sandbox-helper.md): the `vmkit-sandbox` stages, their handshake and the plan file.
+- [docs/apple-vz.md](docs/apple-vz.md): the Apple VZ backend, its helper, and what kiln needs to use it.
+- [docs/spikes/apple-vz.md](docs/spikes/apple-vz.md): the spike that led to it.
 - [docs/superpowers/plans/2026-10-06-vmkit-sandbox-exec.md](docs/superpowers/plans/2026-10-06-vmkit-sandbox-exec.md): the implementation plan for the general program sandbox.
 
 License: Apache-2.0.

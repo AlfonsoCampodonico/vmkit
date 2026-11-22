@@ -1,6 +1,9 @@
 # Spike: kiln guests on Apple's Virtualization.framework
 
-Status: spike, throwaway. Branch `spike/apple-vz`. Run on macOS 27.0.1 (26A434), Apple Silicon.
+Status: done. The helper is now the `apple-vz` backend: `vz/main.swift`, `src/apple_vz.rs`, see
+[../apple-vz.md](../apple-vz.md). The spike's own scripts (`spike/vmkit-vz/`: `host.py`,
+`resettest.sh`, `snaptest.sh`, the flag-driven helper) were removed with that change; they are
+in commit 5d39fd8. Run on macOS 27.0.1 (26A434), Apple Silicon.
 
 **Result: it works.** A static aarch64 musl `kiln-init` built from kiln `main`
 (945e51c) boots under the `vmkit-vz` helper with no Lima in the loop. Its `Hello`
